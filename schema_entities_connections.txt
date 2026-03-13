@@ -1,0 +1,101 @@
+# ENTITIES AND CONNECTIONS (CLIENT COMPLIANCE UPDATE)
+
+## 1. ENTITIES
+
+### USERS
+- Fields: user_id (PK), userName, email, phone, passwordHash, status, createdAt, updatedAt
+- Purpose: System admins/agents monitoring AI and handling escalations.
+
+### CONTACTS (Leads)
+- Fields: contact_id (PK), userName, email, phone, company, source, status, leadScore, budget, projectType, timeline, isQualified (Boolean), assignedUserId (FK), createdAt, updatedAt
+- Purpose: AI qualifies these by asking about scope, budget, and timeline.
+
+### TAGS
+- Fields: tag_id (PK), tagName, createdAt
+- Purpose: Labels for grouping (e.g., "High Intent", "Architect").
+
+### CONTACTTAGS
+- Fields: contactTag_id (PK), contactId (FK), tagId (FK), createdAt
+- Purpose: Linkage between contacts and categories.
+
+### CONVERSATIONS
+- Fields: conversation_id (PK), contactId (FK), channel, status, assignedUserId (FK), aiEnabled (Boolean), escalated (Boolean), qualificationStage, lastIntent, createdAt, updatedAt
+- Purpose: AI-driven interaction threads.
+
+### MESSAGES
+- Fields: message_id (PK), conversationId (FK), senderType, senderId, messageText (Text), messageType, channel, aiGenerated (Boolean), intentDetected, createdAt
+- Purpose: Individual messages analyzed by AI for intent.
+
+### FORMS & QUESTIONNAIRES [NEW]
+- Fields: form_id (PK), title, description, config (JSON/Text), createdAt
+- Purpose: The "Intake Questionnaire" mentioned in requirements.
+
+### FORM_SUBMISSIONS [NEW]
+- Fields: submission_id (PK), formId (FK), contactId (FK), responses (Text/JSON), createdAt
+- Purpose: Captures data from intake forms.
+
+### PIPELINESTAGES
+- Fields: stage_id (PK), stageName, stageOrder, createdAt
+- Purpose: Stages in CRM (e.g., Prospect, Qualified).
+
+### DEALS
+- Fields: deal_id (PK), contactId (FK), stageId (FK), dealValue, probability, expectedClose (Date), assignedUserId (FK), createdAt, updatedAt
+- Purpose: Sales opportunities created after qualification.
+
+### MEETINGS
+- Fields: meeting_id (PK), contactId (FK), conversationId (FK), meetingTime (Timestamp), meetingLink, meetingStatus, createdAt
+- Purpose: Scheduled consultations (Calendly).
+
+### REMINDERS [NEW]
+- Fields: reminder_id (PK), meetingId (FK), reminderTime (Timestamp), status (Pending/Sent), channel (Email/SMS), createdAt
+- Purpose: "Confirm meetings and send reminders" logic.
+
+### TASKS [NEW]
+- Fields: task_id (PK), contactId (FK), assignedUserId (FK), description, dueDate, status (Pending/Done), priority, createdAt
+- Purpose: "Create follow-up tasks" for humans or AI.
+
+### CAMPAIGNS
+- Fields: campaign_id (PK), campaignName, campaignType, status, createdBy (FK to USERS), createdAt
+- Purpose: Outreach initiatives.
+
+### CAMPAIGNTARGETS
+- Fields: target_id (PK), campaignId (FK), userName, email, company, profession, status, createdAt
+- Purpose: Outreach targets (Contractors, Architects, etc.).
+
+### CAMPAIGNMESSAGES
+- Fields: message_id (PK), campaignId (FK), targetId (FK), messageText (Text), sendStatus, responseReceived (Boolean), createdAt
+- Purpose: Automated outreach broadcast.
+
+### AUTOMATIONS
+- Fields: automation_id (PK), automationName, triggerType, actionType, config (Text), status, createdAt
+- Purpose: Rules for triggering AI or CRM updates.
+
+### AIPROVIDERS / MODELS / KEYS / CONFIGS / LOGS
+- Purpose: The technical AI stack powering the agent's brain.
+
+### KNOWLEDGEBASE (RAG)
+- Purpose: FAQs and company info used for "Answer common client questions".
+
+### INTEGRATIONS / INTEGRATIONLOGS
+- Purpose: GoHighLevel, Calendly, Twilio, SMS, Email synchronization.
+
+### ACTIVITYLOGS
+- Purpose: Audit trail documenting every "Update CRM record" or "Trigger automation".
+
+---
+
+## 2. CONNECTIONS (REQUIREMENT MAPPING)
+
+| Requirement | Entity/Connection Logic |
+| :--- | :--- |
+| **Respond to messages** | `MESSAGES` -> `CONVERSATIONS` |
+| **Answer FAQ** | `KNOWLEDGEBASE` -> AI -> `MESSAGES` |
+| **Booking & Confirmations** | `MEETINGS` + `REMINDERS` |
+| **Route to human** | `CONVERSATIONS.escalated` -> `TASKS` |
+| **Lead Qualification** | `CONTACTS.isQualified` + `qualificationStage` |
+| **Project Scope/Budget** | `CONTACTS.projectType` + `CONTACTS.budget` |
+| **Intake Questionnaire** | `FORMS` + `FORM_SUBMISSIONS` |
+| **Business Outreach** | `CAMPAIGNS` + `CAMPAIGNTARGETS` |
+| **CRM Sync** | `INTEGRATIONS` + `INTEGRATIONLOGS` |
+| **Organize Pipeline** | `PIPELINESTAGES` + `DEALS` |
+| **Decision Making** | `MESSAGES.intentDetected` -> AI Logic |

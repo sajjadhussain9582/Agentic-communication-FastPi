@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Response, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 from typing import List
 from app.db.session import engine
@@ -7,19 +8,25 @@ from app.models.user import User
 from app.core.security import hash_password, verify_password, create_session_token
 from app.api.deps.auth import get_current_user
 
-router = APIRouter(prefix="/users", tags=["Users"])
+router = APIRouter(tags=["Users"])
 
 
 @router.post("/register")
 def register(user_in: UserCreate):
+    if not user_in.password:
+        raise HTTPException(status_code=400, detail="Password required")
     with Session(engine) as session:
         user = User(
             email=user_in.email,
             password=hash_password(user_in.password),
-            status=user_in.status if user_in.status else "active"
+            status=user_in.status if user_in.status else "active",
         )
         session.add(user)
-        session.commit()
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            raise HTTPException(status_code=409, detail="Email already registered")
         session.refresh(user)
     return {"message": "User created"}
 

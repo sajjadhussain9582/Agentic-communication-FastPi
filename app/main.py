@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from app.api.router import api_router
+from app.api.routes.users import router as users_router
 from app.core.middleware import setup_cors
 from app.core.logging import setup_logging
 from app.core.database import init_db
@@ -14,8 +15,18 @@ def create_app():
     @app.on_event("startup")
     def on_startup():
         init_db()
+        from sqlmodel import Session
 
+        from app.core.database import engine
+        from app.core.seed import seed_if_empty
+
+        with Session(engine) as session:
+            seed_if_empty(session)
+
+    # Main API under /api/v1 (e.g. /api/v1/users/register)
     app.include_router(api_router, prefix="/api/v1")
+    # Frontend-friendly path: /v1/user/register (singular, no "api")
+    app.include_router(users_router, prefix="/v1/user")
 
     return app
 

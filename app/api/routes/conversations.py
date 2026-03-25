@@ -149,7 +149,7 @@ def list_conversations(
 
 
 @router.post("/{conversation_uuid}/messages", response_model=MessageRead)
-def post_conversation_message(
+async def post_conversation_message(
     conversation_uuid: str,
     body: PostMessageBody,
     _: User = Depends(get_current_user),
@@ -180,7 +180,7 @@ def post_conversation_message(
             contact = session.get(Contact, c.contact_id)
             if contact:
                 recipient = contact.email if ch == "email" else (contact.phone or contact.email)
-        deliver_message(
+        await deliver_message(
             session,
             channel=ch,
             recipient=recipient,

@@ -154,7 +154,7 @@ def patch_campaign(
 
 
 @router.post("/{campaign_uuid}/send")
-def send_campaign(
+async def send_campaign(
     campaign_uuid: str,
     _: User = Depends(get_current_user),
     session: Session = Depends(get_session),
@@ -214,7 +214,7 @@ def send_campaign(
             message_text=personalized,
             send_status="sent",
         )
-        deliver_message(
+        await deliver_message(
             session,
             channel=c.channel,
             recipient=t.email,

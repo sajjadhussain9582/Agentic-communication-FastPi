@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlmodel import Session, select
@@ -10,6 +11,7 @@ from app.core.config import settings
 from app.db.session import get_session
 from app.models.integration import Integration, IntegrationRun
 from app.models.user import User
+from app.schemas.integration import EmailConfigSMTP, EmailConfigResend, CalendlyConfig
 
 router = APIRouter(prefix="/integrations", tags=["Integrations"])
 
@@ -127,6 +129,92 @@ def sync_integration(
     )
     session.commit()
     return {"ok": True, "provider": provider, "status": row.status, "last_sync_at": row.last_sync_at}
+
+
+@router.post("/email/configure")
+def configure_email(
+    config: EmailConfigSMTP | EmailConfigResend,
+    _: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    row = session.exec(select(Integration).where(Integration.provider == "email")).first()
+    if not row:
+        row = Integration(provider="email")
+    
+    row.config_json = config.model_dump()
+    row.status = "connected"
+    row.updated_at = datetime.utcnow()
+    session.add(row)
+    session.flush() # Ensure ID is populated
+    
+    run = IntegrationRun(
+        integration_id=row.id,
+        action="configure_email",
+        status="ok",
+        detail=f"Email configured as {config.type}",
+    )
+    session.add(run)
+    session.commit()
+    return {"ok": True, "provider": "email", "status": row.status}
+
+
+@router.post("/calendly/configure")
+def configure_calendly(
+    config: CalendlyConfig,
+    _: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    row = session.exec(select(Integration).where(Integration.provider == "scheduling")).first()
+    if not row:
+        row = Integration(provider="scheduling")
+    
+    row.config_json = config.model_dump()
+    row.status = "connected"
+    row.updated_at = datetime.utcnow()
+    session.add(row)
+    session.flush() # Ensure ID is populated
+    
+    run = IntegrationRun(
+        integration_id=row.id,
+        action="configure_calendly",
+        status="ok",
+        detail=f"Calendly configured as {config.type}",
+    )
+    session.add(run)
+    session.commit()
+    return {"ok": True, "provider": "scheduling", "status": row.status}
+
+
+@router.get("/calendly/event-types")
+async def get_calendly_event_types(
+    _: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    row = session.exec(select(Integration).where(Integration.provider == "scheduling")).first()
+    if not row or not row.config_json or "token" not in row.config_json:
+        raise HTTPException(400, "Calendly not configured with PAT")
+    
+    token = row.config_json["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    async with httpx.AsyncClient() as client:
+        # 1. Get current user info to get URI
+        try:
+            user_res = await client.get("https://api.calendly.com/users/me", headers=headers)
+            user_res.raise_for_status()
+            user_uri = user_res.json()["resource"]["uri"]
+            
+            # 2. Get event types for this user
+            events_res = await client.get(
+                f"https://api.calendly.com/event_types?user={user_uri}&active=true", 
+                headers=headers
+            )
+            events_res.raise_for_status()
+            return events_res.json()
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(e.response.status_code, f"Calendly API error: {e.response.text}")
+        except Exception as e:
+            raise HTTPException(500, f"Internal error: {str(e)}")
 
 
 @router.get("/{provider}/runs", response_model=list[IntegrationRunRead])

@@ -1,0 +1,298 @@
+Phase 2 — Move retrieval into Postgres
+
+Right now your retrieval is happening in Python, which is weak and hard to scale.
+
+You should move matching into Postgres using pgvector.
+
+Step 4: Check whether pgvector is enabled
+
+In Supabase SQL editor, run:
+
+create extension if not exists vector;
+
+If it succeeds, good.
+
+Step 5: Add a real vector column
+
+Right now you store embeddings in embedding_json. That is not ideal for vector search.
+
+Add a real vector column.
+
+For example, if your embedding model dimension is 1536:
+
+alter table knowledge_base
+add column if not exists embedding vector(1536);
+
+If you use a newer OpenAI embedding model with different dimension, use that exact dimension instead.
+
+Step 6: Backfill the vector column
+
+You currently store JSON embeddings as text. You need to migrate them.
+
+There are two options:
+
+Better option
+
+Re-embed everything in Python and store directly into embedding
+
+Temporary option
+
+Parse old JSON and convert, but re-embedding is cleaner
+
+Best approach: write a one-time script that:
+
+loads each KB row
+regenerates embedding using current model
+updates the embedding vector column
+Phase 3 — Write a proper Postgres match function
+Step 7: Create a similarity match function
+
+In Supabase SQL editor, create a function like this:
+
+create or replace function match_knowledge_base (
+  query_embedding vector(1536),
+  match_count int default 5,
+  filter_category text default null
+)
+returns table (
+  id bigint,
+  question text,
+  answer text,
+  category text,
+  similarity float
+)
+language sql
+as $$
+  select
+    kb.id,
+    kb.question,
+    kb.answer,
+    kb.category,
+    1 - (kb.embedding <=> query_embedding) as similarity
+  from knowledge_base kb
+  where kb.embedding is not null
+    and (filter_category is null or kb.category = filter_category)
+  order by kb.embedding <=> query_embedding
+  limit match_count;
+$$;
+
+This uses cosine distance-style ranking through pgvector.
+
+Step 8: Add an index
+
+This improves retrieval speed later.
+
+create index if not exists knowledge_base_embedding_idx
+on knowledge_base
+using ivfflat (embedding vector_cosine_ops)
+with (lists = 100);
+
+After creating the index, run:
+
+analyze knowledge_base;
+Phase 4 — Update your Python code
+Step 9: Stop using embedding_json for matching
+
+Your current search_similar() should no longer:
+
+fetch all rows
+parse JSON
+compute cosine manually
+
+Instead, it should:
+
+embed the query
+call the Postgres match function
+return ranked rows
+Step 10: Rewrite search_similar()
+
+Conceptually, it should do this:
+
+create query embedding
+call match_knowledge_base
+apply minimum similarity threshold
+return top chunks
+
+The logic becomes:
+
+Python handles embedding generation
+Postgres handles ranking
+Phase 5 — Write LangChain tools
+
+Now comes the tool layer.
+
+Step 11: Create a KB retrieval tool
+
+Write a LangChain tool that wraps your retrieval.
+
+Tool idea:
+
+name: search_knowledge_base
+input:
+query
+optional category
+optional top_k
+output:
+matched KB chunks with similarity
+
+Example behavior:
+
+user asks about MVP
+agent calls tool
+tool returns top KB entries
+agent answers using grounded content
+Step 12: Create specialized tools, not just one generic tool
+
+This is where your system gets smarter.
+
+Create tools like:
+
+search_pricing_guidance
+
+For:
+
+budget
+discount
+cost
+negotiation
+search_mvp_guidance
+
+For:
+
+MVP
+feature suggestions
+early-stage leads
+unclear requirements
+search_partnership_guidance
+
+For:
+
+contractors
+agents
+architects
+builders
+referral collaboration
+search_booking_guidance
+
+For:
+
+consultations
+scheduling
+next steps
+
+These can all call the same Postgres function underneath, but with different category filtering or prompt instructions.
+
+Phase 6 — Improve retrieval behavior
+Step 13: Add hybrid logic before vector search
+
+Pure semantic search is not always enough.
+
+Before calling vector search, detect keywords in the query.
+
+Example:
+
+if query contains budget, price, discount → prefer pricing categories
+if query contains MVP, feature, start, basic version → prefer MVP categories
+if query contains partner, referral, collaboration → prefer partnership categories
+
+This can be done in Python before tool call.
+
+Step 14: Add a similarity cutoff
+
+Do not always trust the top result.
+
+Example:
+
+if top similarity < 0.75, say “low-confidence retrieval”
+then either:
+ask clarification
+or use broader fallback guidance
+Step 15: Return scores during debugging
+
+While improving, log:
+
+query
+category chosen
+top ids
+top similarity scores
+
+This will help a lot.
+
+Phase 7 — Improve content quality
+Step 16: Write 15–20 strong KB entries first
+
+Start with these topics:
+
+What should I build first: website or app?
+I don’t know my features yet
+What does a basic MVP include?
+What does a real estate MVP include?
+How much does an MVP usually cost?
+How long does an MVP usually take?
+Can the budget be flexible?
+How does consultation work?
+What information is needed before proposal?
+Do I need a full app or just a website?
+Can we start small and scale later?
+What happens after discovery?
+How do partnerships work?
+How do referrals work?
+How is pricing affected by scope?
+
+These will give your assistant much better grounded answers.
+
+Step 17: Write answers in a sales-assistant style
+
+Answers should be:
+
+clear
+practical
+short enough to reuse
+not overly formal
+not too generic
+Phase 8 — Connect this into LangChain
+Step 18: Tool routing logic
+
+Your agent should not always retrieve the same way.
+
+Suggested routing:
+
+pricing questions → pricing tool
+unclear leads → MVP guidance tool
+partner inquiries → partnership tool
+scheduling questions → booking tool
+Step 19: Use retrieved chunks as grounded context only
+
+Do not let the model invent around them too much.
+
+Prompt rule:
+
+answer primarily from retrieved chunks
+if info is missing, ask a targeted follow-up
+do not repeat same questions if already answered
+Phase 9 — Cleanup your DB model
+Step 20: Update your model
+
+Your current model comment says:
+
+embedding stored as JSON string of floats
+
+That should change.
+
+Add a proper vector field in your ORM model if your stack supports it, or at least stop relying on embedding_json for retrieval.
+
+You can keep embedding_json temporarily for migration, but long-term use:
+
+embedding vector(...)
+What you should do first, in exact order
+Immediate order
+Write 15–20 better KB entries
+Enable pgvector
+Add embedding vector column
+Re-embed all KB records into that column
+Create match_knowledge_base() function
+Replace Python cosine matching with DB function
+Add one LangChain retrieval tool
+Then add category-specific tools
+Add keyword/category routing
+Log retrieval scores during testing

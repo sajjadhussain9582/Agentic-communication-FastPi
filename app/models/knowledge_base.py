@@ -4,16 +4,20 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Column, String
+from sqlalchemy import Column, String, JSON
 from sqlmodel import Field, SQLModel
-
+from typing import Optional, Any
 
 def _new_uuid() -> str:
     return str(uuid.uuid4())
 
-
 class KnowledgeBaseEntry(SQLModel, table=True):
-    """FAQ row for RAG; embedding stored as JSON string of floats (OpenAI ada-002 dimension 1536)."""
+    """FAQ row for RAG retrieval.
+
+    Primary retrieval uses the pgvector `embedding vector(1536)` column
+    via the `match_knowledge_base()` Postgres function.
+    The `embedding_json` column is kept for backward compatibility only.
+    """
 
     __tablename__ = "knowledge_base"
 
@@ -25,5 +29,11 @@ class KnowledgeBaseEntry(SQLModel, table=True):
     question: str
     answer: str
     category: Optional[str] = Field(default=None, index=True)
-    embedding_json: Optional[str] = None  # JSON array of floats
+    keywords: list[Any] = Field(default_factory=list, sa_column=Column(JSON))
+    intent_type: str | None = Field(default=None, index=True)
+    role_type: str | None = Field(default=None, index=True)
+    priority: int = Field(default=0, index=True)
+    tags: list[Any] = Field(default_factory=list, sa_column=Column(JSON))
+    embedding_json: Optional[str] = None  # DEPRECATED — kept for backward compat; use pgvector `embedding` column
+    # Note: the `embedding vector(1536)` column is managed via raw SQL in phase2_migrate.py
     created_at: datetime = Field(default_factory=datetime.utcnow)

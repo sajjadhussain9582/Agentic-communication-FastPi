@@ -18,6 +18,7 @@ from app.models.contact import Contact
 from app.models.conversation import Conversation
 from app.models.message import Message
 from app.services.estimator import estimate_project
+from app.services.kb_router import detect_category
 from app.services.kb_rag import format_rag_context, search_similar
 from app.services.metrics import record_outcome
 from app.services.pipeline_manager import sync_pipeline_stage
@@ -132,6 +133,9 @@ REPLY_PROMPT = """You are a professional client-facing partnership assistant. Wr
 
 Rules:
 - Ground factual claims ONLY in the FAQ/knowledge excerpts below. If something is not in the excerpts, do not make up policies, prices, or guarantees.
+- Answer primarily from retrieved KB chunks. If the information needed is missing from the excerpts, acknowledge the gap honestly and ask a targeted follow-up question instead of guessing.
+- If retrieval confidence is low (indicated by low scores or no matches), acknowledge uncertainty and suggest a consultation instead of speculating.
+- Do not repeat questions that have already been answered in earlier turns.
 - Always position the company as a connector that introduces vetted partners across contractors, real estate agents, developers, architects, and home builders.
 - Do not claim your team directly provides architecture/design/construction execution.
 - Do not use internal platform positioning as the core customer offer (avoid presenting automation/lead-qualification tooling as direct service delivery).
@@ -304,9 +308,24 @@ def build_graph(session: Session):
 
     def node_retrieve(state: AgentState) -> dict[str, Any]:
         q = state.get("user_text", "")[:8000]
-        chunks, kb_ids = search_similar(session, q, top_k=5, min_score=0.2)
+        # Phase 6: Hybrid routing — detect category from keywords first
+        routed_category = detect_category(q)
+        chunks, kb_ids = search_similar(
+            session, q, top_k=5, min_score=0.35, category=routed_category,
+        )
+        # Confidence cutoff: if best score is low, flag it
+        low_confidence = False
+        if chunks and chunks[0].score < 0.40:
+            low_confidence = True
+            logger.warning(
+                "Low-confidence retrieval: best_score=%.3f query='%s'",
+                chunks[0].score, q[:60],
+            )
+        rag_ctx = format_rag_context(chunks)
+        if low_confidence:
+            rag_ctx += "\n\n(NOTE: Retrieval confidence is LOW. Prefer asking a clarifying question over speculating.)"
         return {
-            "rag_context": format_rag_context(chunks),
+            "rag_context": rag_ctx,
             "rag_kb_ids": kb_ids,
         }
 

@@ -79,12 +79,102 @@ def ensure_schema_phase2() -> None:
         else:
             alters_sqlite.append("ALTER TABLE contacts ADD COLUMN stage VARCHAR(64) DEFAULT 'new'")
 
+    if not _has_column(insp, "knowledge_base", "intent_type"):
+        if d == "postgresql":
+            alters_pg.append("ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS keywords JSONB DEFAULT '[]'::jsonb")
+            alters_pg.append("ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS intent_type VARCHAR(255)")
+            alters_pg.append("ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS role_type VARCHAR(255)")
+            alters_pg.append("ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS priority INTEGER DEFAULT 0")
+            alters_pg.append("ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS tags JSONB DEFAULT '[]'::jsonb")
+        else:
+            alters_sqlite.append("ALTER TABLE knowledge_base ADD COLUMN keywords TEXT DEFAULT '[]'")
+            alters_sqlite.append("ALTER TABLE knowledge_base ADD COLUMN intent_type VARCHAR(255)")
+            alters_sqlite.append("ALTER TABLE knowledge_base ADD COLUMN role_type VARCHAR(255)")
+            alters_sqlite.append("ALTER TABLE knowledge_base ADD COLUMN priority INTEGER DEFAULT 0")
+            alters_sqlite.append("ALTER TABLE knowledge_base ADD COLUMN tags TEXT DEFAULT '[]'")
+
     with engine.begin() as conn:
         for s in alters_pg + alters_sqlite:
             try:
                 conn.execute(text(s))
             except Exception:
                 pass  # idempotent / sqlite older
+
+    # ── Phase 2-3: pgvector extension, vector column, match function, index ──
+    if d == "postgresql":
+        insp = inspect(engine)
+        with engine.begin() as conn:
+            # 1. Enable pgvector extension
+            try:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            except Exception:
+                pass
+
+            # 2. Add real vector(1536) column for native similarity search
+            if not _has_column(insp, "knowledge_base", "embedding"):
+                try:
+                    conn.execute(text(
+                        "ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS embedding vector(1536)"
+                    ))
+                except Exception:
+                    pass
+
+            # 3. Create match_knowledge_base() function for server-side similarity
+            try:
+                conn.execute(text("""
+                    CREATE OR REPLACE FUNCTION match_knowledge_base(
+                        query_embedding vector(1536),
+                        match_count int DEFAULT 5,
+                        filter_category text DEFAULT NULL
+                    )
+                    RETURNS TABLE (
+                        id bigint,
+                        question text,
+                        answer text,
+                        category text,
+                        intent_type text,
+                        role_type text,
+                        priority integer,
+                        keywords jsonb,
+                        tags jsonb,
+                        similarity float
+                    )
+                    LANGUAGE sql STABLE
+                    AS $$
+                        SELECT
+                            kb.id::bigint,
+                            kb.question,
+                            kb.answer,
+                            kb.category,
+                            kb.intent_type,
+                            kb.role_type,
+                            kb.priority,
+                            kb.keywords,
+                            kb.tags,
+                            1 - (kb.embedding <=> query_embedding) AS similarity
+                        FROM knowledge_base kb
+                        WHERE kb.embedding IS NOT NULL
+                          AND (filter_category IS NULL OR kb.category = filter_category)
+                        ORDER BY kb.embedding <=> query_embedding
+                        LIMIT match_count;
+                    $$;
+                """))
+            except Exception:
+                pass
+
+            # 4. IVFFlat index for fast cosine search
+            try:
+                conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS knowledge_base_embedding_idx "
+                    "ON knowledge_base USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)"
+                ))
+            except Exception:
+                pass
+
+            try:
+                conn.execute(text("ANALYZE knowledge_base"))
+            except Exception:
+                pass
 
     # Refresh inspector after DDL
     insp = inspect(engine)

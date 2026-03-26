@@ -22,6 +22,9 @@ def create_app():
 
         with Session(engine) as session:
             seed_if_empty(session)
+        
+        from app.services.worker import start_worker
+        start_worker()
 
     # Main API under /api/v1 (e.g. /api/v1/users/register)
     app.include_router(api_router, prefix="/api/v1")

@@ -38,6 +38,12 @@ class Contact(SQLModel, table=True):
     tags: list[Any] = Field(default_factory=list, sa_column=Column(JSON))
     notes: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
     stage: str = Field(default="new", sa_column=Column(String(64), nullable=True))
+    pipeline_stage: str = Field(default="lead", sa_column=Column(String(64), index=True))
+    stage_entered_at: datetime = Field(default_factory=datetime.utcnow)
+    last_outbound_at: Optional[datetime] = None
+    qualification_evidence: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON, nullable=True)
+    )
     external_ids: dict[str, Any] = Field(
         default_factory=dict, sa_column=Column(JSON, nullable=True)
     )

@@ -19,6 +19,9 @@ from app.models.conversation import Conversation
 from app.models.message import Message
 from app.services.estimator import estimate_project
 from app.services.kb_rag import format_rag_context, search_similar
+from app.services.metrics import record_outcome
+from app.services.pipeline_manager import sync_pipeline_stage
+from app.services.policy_engine import validate_action
 from app.services.workflow_engine import run_decision_workflows
 
 logger = logging.getLogger(__name__)
@@ -26,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 class AgentState(TypedDict, total=False):
     user_text: str
+    is_proactive: bool
     channel: str
     json_snapshot: str
     rag_context: str
@@ -41,50 +45,52 @@ class AgentState(TypedDict, total=False):
     should_include_cta: bool
     error: str
 
-
 PERSONA_POLICIES: dict[str, dict[str, str]] = {
     "contractor": {
-        "focus": "crew capacity, project volume, subcontracting model, turnaround expectations",
-        "questions": "service area, project size, monthly lead capacity, preferred engagement model",
-        "cta": "Offer a short partnership planning call with available time windows.",
+        "focus": "assess if they are a potential partner or service buyer; understand project pipeline, subcontracting needs, and urgency",
+        "questions": "are you looking for leads or services, project size, service area, current challenges, timeline and budget context",
+        "cta": "If partner-fit, offer a partnership alignment call; if project-fit, guide toward consultation booking with clear next steps.",
     },
     "agent": {
-        "focus": "listing pipeline, buyer/seller mix, referral collaboration, communication cadence",
-        "questions": "markets served, transaction volume, referral goals, lead handoff preferences",
-        "cta": "Invite them to a co-marketing or referral alignment call.",
+        "focus": "identify if this is a referral partnership or direct service need; understand transaction volume and collaboration goals",
+        "questions": "markets served, monthly transactions, referral expectations, type of collaboration, decision-making role",
+        "cta": "If partnership-driven, invite to co-marketing/referral call; if service-driven, guide toward consultation with clear value.",
     },
     "developer": {
-        "focus": "portfolio scope, timelines, multi-project rollout, partner SLA requirements",
-        "questions": "project phases, decision stakeholders, budget range, deployment timeline",
-        "cta": "Propose a discovery call with implementation and partnership stakeholders.",
+        "focus": "determine if they are a serious buyer or long-term partner; assess project scope, stakeholders, and delivery expectations",
+        "questions": "project type, phases, stakeholders involved, budget range, deployment timeline, decision authority",
+        "cta": "If qualified, propose discovery/consultation call; if early-stage, continue structured qualification before booking.",
     },
     "architect": {
-        "focus": "design collaboration flow, proposal cycles, technical coordination needs",
-        "questions": "project type, design stage, collaboration expectations, timeline and budget context",
-        "cta": "Offer a design-collaboration discovery call.",
+        "focus": "understand collaboration potential vs active project need; evaluate design stage, coordination needs, and seriousness",
+        "questions": "project type, design stage, collaboration expectations, stakeholders, timeline and budget clarity",
+        "cta": "If collaboration-fit, offer design partnership discussion; if project-fit, guide toward structured consultation.",
     },
     "builder": {
-        "focus": "build pipeline, vendor/partner coordination, scheduling and quality expectations",
-        "questions": "build volume, locations, current process bottlenecks, timeline and budget",
-        "cta": "Suggest a partnership kickoff call to map the first pilot process.",
+        "focus": "assess build pipeline and partnership potential; identify operational gaps and urgency of current projects",
+        "questions": "build volume, locations, bottlenecks, current workflow gaps, timeline and budget signals",
+        "cta": "If high intent, suggest partnership kickoff or consultation; if unclear, continue qualification before pushing meeting.",
     },
     "unknown": {
-        "focus": "business partnership potential and qualification for next steps",
-        "questions": "role, geography, project scope, budget, timeline, and decision authority",
-        "cta": "Ask for a brief consult call and preferred availability.",
+        "focus": "identify role, intent, and seriousness before deciding next step; avoid premature assumptions",
+        "questions": "what is your role, what are you trying to achieve, project scope, budget, timeline, and decision authority",
+        "cta": "If enough clarity, guide to consultation; otherwise continue qualification with minimal friction.",
     },
 }
 
+DECISION_PROMPT = """You are an internal analyst for a B2B services company focused on growth partnerships and client qualification.
+Based on the user's message, prior context, and form data, output ONLY valid JSON with these keys:
 
-DECISION_PROMPT = """You are an internal analyst for a B2B services company focused on growth partnerships.
-Based on the user's message and form data, output ONLY valid JSON with these keys:
-- last_intent: short string (e.g. pricing, support, new_lead, partnership, follow_up)
-- persona_segment: one of: contractor, agent, developer, architect, builder, unknown
+- role_type: one of: contractor, agent, developer, architect, builder, unknown
+- intent_type: one of: service_inquiry, pricing_request, booking_request, partnership_inquiry, support_request, follow_up, complaint, nurture
+- relationship_type: one of: inbound_lead, outbound_prospect, referral_partner, existing_client, dormant_lead, reengaged_lead
+- decision_role: one of: decision_maker, influencer, researcher, assistant, unknown
+- engagement_temperature: one of: cold, warm, hot
 - qualification_stage: one of: discovery, qualified, not_qualified, needs_info
-- is_escalated: true if a human should handle this (legal, complaints, highly complex, or user explicitly asks for human)
+- is_escalated: true if a human should handle this (legal, complaints, highly complex enterprise architectures, sensitive issues, repeatedly frustrated user, or user explicitly asks for human)
 - conversation_status: one of: open, pending_human, closed
 - lead_score: number 0-100 or null if unknown
-- is_qualified: boolean or null
+- is_qualified: true if serious client with realistic budget and scope, false if obviously unrelated or low intent/spam, null otherwise
 - budget: string or null
 - project_type: string or null
 - timeline: string or null
@@ -100,11 +106,16 @@ Based on the user's message and form data, output ONLY valid JSON with these key
 - cta_readiness_score: number 0-100
 
 Rules:
+- Categorize the contact's role_type, intent_type, relationship_type, decision_role, and engagement_temperature from message/context.
+- Use role_type only for industry/business-role classification.
+- Use relationship_type to distinguish inbound leads, outbound prospects, referral partners, existing clients, dormant leads, and reengaged leads.
+- Use decision_role to reflect whether the contact appears to be the decision maker, an influencer, a researcher, an assistant, or unknown.
 - Prefer partnership/business development framing when applicable.
-- Infer persona_segment from message/context; use unknown when unclear.
-- Keep values concise and factual.
-- Infer a practical next_action that moves the deal forward.
+- Keep values concise, practical, and factual.
+- Infer a practical next_action that moves the conversation forward safely.
 - Favor moving from discovery -> estimation_ready -> proposal_ready when enough detail exists.
+- Mark not_qualified only when there is a clear reason; otherwise prefer needs_info.
+- If confidence is low, leave uncertain fields as null and include them in missing_fields instead of guessing.
 - Do not include any keys beyond the schema above.
 
 Form/channel context:
@@ -126,21 +137,36 @@ Rules:
 - Do not use internal platform positioning as the core customer offer (avoid presenting automation/lead-qualification tooling as direct service delivery).
 - If excerpts are missing or insufficient, keep confidence low but still provide a concrete next step.
 - Avoid defensive phrasing such as "we do not handle this" or "we don't provide that."
-- Turn behavior:
-  - If conversation_turn == 1: use a short greeting and opening.
-  - If conversation_turn > 1: no repeated greeting/signature; continue naturally from prior context.
-  - Do not end every message with a meeting ask.
-  - Ask only the next best 1-2 questions from missing_fields/next_best_questions.
-  - Max 1-2 follow-up questions per turn.
-  - If user asks budget/time, answer with concrete ranges in this same reply before any follow-up question.
-  - Do not ask for slots already present in filled_fields.
-  - If stage is proposal_ready/close_ready, prioritize close action (shortlist, proposal, or booking) over new discovery questions.
-  - Briefly reference the user's latest details naturally.
+
+Turn behavior:
+- If context indicates a proactive system nudge: write a warm re-engagement message. Do not assume they just messaged you. Reference their previous project context naturally and ask if they have any updates or need a partner introduction.
+- If conversation_turn == 1: use a short greeting and opening.
+- If conversation_turn > 1: do not repeat greeting/signature; continue naturally from prior context.
+- Do not end every message with a meeting ask.
+- Ask only the next best 1-2 questions from missing_fields/next_best_questions.
+- Max 1-2 follow-up questions per turn.
+- If user asks budget/time, answer with concrete ranges in this same reply before any follow-up question.
+- Do not ask for slots already present in filled_fields.
+- If stage is proposal_ready or close_ready, prioritize close action (shortlist, proposal, or booking) over new discovery questions.
+- Briefly reference the user's latest details naturally.
 - If user asks for partner contact details directly, do not dump raw personal phone/email data. Offer curated shortlist + warm intro workflow.
-- Tone: executive, clear, warm, concise, and human-like (not templated).
-- Channel context: {channel}
+
+Tone:
+- Executive, clear, warm, concise, and human-like.
+- Adapt tone based on relationship context, decision role, and engagement temperature.
+- If relationship_type is referral_partner or outbound_prospect, lean more toward business-development language.
+- If relationship_type is inbound_lead or existing_client, lean more toward advisory and qualification language.
+- If engagement_temperature is hot, be more direct and action-oriented.
+- If engagement_temperature is cold, be more consultative and lower-pressure.
+- If qualification_stage is needs_info or discovery, proactively offer the user our standard Intake Questionnaire. Provide a generic link: 'Please complete our quick [Intake Questionnaire](/client-intake) to help us prepare a custom estimate.'
+
+Context:
+- Channel context (Email vs SMS vs Website): {channel}
+- Role type: {role_type}
+- Relationship context (Inbound vs Outbound vs Referral): {relationship_type}
+- Engagement temperature (Cold vs Warm vs Hot): {engagement_temperature}
+- Decision role (Decision Maker vs Influencer vs Researcher vs Assistant): {decision_role}
 - Booking URL (if available): {booking_url}
-- Persona segment: {persona_segment}
 - Persona guidance: {persona_policy}
 - Conversation turn: {conversation_turn}
 - Recent context summary: {recent_context}
@@ -152,12 +178,11 @@ Rules:
 FAQ / knowledge excerpts:
 {rag_context}
 
-Internal notes (do not repeat verbatim; use to tailor tone): {decision_json}
+Internal notes (do not repeat verbatim; use only to tailor tone and next step): {decision_json}
 
 User message:
 {user_text}
 """
-
 
 def _parse_decision(raw: str) -> dict[str, Any]:
     raw = raw.strip()
@@ -336,10 +361,10 @@ def build_graph(session: Session):
             decision_obj = json.loads(state.get("decision_json", "{}"))
         except json.JSONDecodeError:
             decision_obj = {}
-        persona_segment = str(decision_obj.get("persona_segment") or "unknown")
-        if persona_segment not in PERSONA_POLICIES:
-            persona_segment = "unknown"
-        persona_policy = PERSONA_POLICIES[persona_segment]
+        role_type = str(decision_obj.get("role_type") or decision_obj.get("persona_segment") or "unknown")
+        if role_type not in PERSONA_POLICIES:
+            role_type = "unknown"
+        persona_policy = PERSONA_POLICIES[role_type]
         conversation_turn = int(state.get("conversation_turn", 1))
         missing_fields = state.get("missing_fields", "")
         filled_fields = state.get("filled_fields", "")
@@ -352,11 +377,15 @@ def build_graph(session: Session):
 
         prompt = REPLY_PROMPT.format(
             channel=state.get("channel", "website"),
+            relationship_type=decision_obj.get("relationship_type", "unknown"),
+            engagement_temperature=decision_obj.get("engagement_temperature", "warm"),
+            decision_role=decision_obj.get("decision_role", "unknown"),
             rag_context=state.get("rag_context", ""),
             decision_json=state.get("decision_json", "{}"),
             user_text=state.get("user_text", ""),
             booking_url=state.get("booking_url", ""),
-            persona_segment=persona_segment,
+            persona_segment=role_type,
+            role_type=role_type,
             persona_policy=json.dumps(persona_policy),
             conversation_turn=conversation_turn,
             recent_context=state.get("recent_context", ""),
@@ -391,11 +420,17 @@ def run_ai_pipeline(
     session: Session,
     conversation: Conversation,
     contact: Contact,
-    inbound_message: Message,
-    json_response: dict,
+    inbound_message: Message | None = None,
+    json_response: dict | None = None,
 ) -> Message:
     """Runs graph, updates contact/conversation, creates outbound Message."""
-    user_text = inbound_message.message
+    is_proactive = inbound_message is None
+    if is_proactive:
+        user_text = "(System nudge: Lead has been silent. Re-engage politely based on prior context.)"
+    else:
+        user_text = inbound_message.message
+
+    json_response = json_response or {}
     channel = conversation.channel
     conversation_turn = len(
         list(
@@ -413,6 +448,7 @@ def run_ai_pipeline(
     graph = build_graph(session)
     initial: AgentState = {
         "user_text": user_text,
+        "is_proactive": is_proactive,
         "channel": channel,
         "json_snapshot": json.dumps(json_response, default=str)[:12000],
         "booking_url": settings.CALENDLY_BOOKING_URL or "",
@@ -431,15 +467,15 @@ def run_ai_pipeline(
     except json.JSONDecodeError:
         pass
 
-    conversation.last_intent = str(decision.get("last_intent") or "unknown")[:500]
-    conversation.qualification_stage = str(
-        decision.get("qualification_stage") or "needs_info"
-    )[:200]
+    conversation.last_intent = str(decision.get("intent_type") or decision.get("last_intent") or "unknown")[:500]
     conversation.is_escalated = bool(decision.get("is_escalated"))
     conversation.status = str(decision.get("conversation_status") or "open")[:100]
     from datetime import datetime
 
     conversation.updated_at = datetime.utcnow()
+
+    # Apply V2 Governed Pipeline Sync
+    sync_pipeline_stage(session, contact, decision)
 
     if decision.get("lead_score") is not None:
         try:
@@ -468,6 +504,15 @@ def run_ai_pipeline(
         missing_fields=missing_fields,
         conversation_stage=conversation_stage,
     )
+
+    # 3. Governance Layer (V2 Action Approval Matrix)
+    # Filter the AI's requested action against our coded business policies.
+    if not validate_action(contact, next_action):
+        next_action = "ask_missing_info" # Fallback to safe action
+        logger.warning(f"Governance restricted AI from taking action: {decision.get('next_action')}")
+
+    if next_action == "book_consultation":
+        record_outcome(session, contact.id, "booking_intent")
     # Persist lightweight state for turn-aware behavior in future messages.
     ext = contact.external_ids if isinstance(contact.external_ids, dict) else {}
     ext["ai_state"] = {
@@ -512,8 +557,9 @@ def run_ai_pipeline(
         rag_source_kb_ids=kb_ids,
     )
     session.add(outbound)
-    inbound_message.is_handled = True
-    session.add(inbound_message)
+    if inbound_message:
+        inbound_message.is_handled = True
+        session.add(inbound_message)
     session.commit()
     session.refresh(outbound)
     _log_reply_quality(

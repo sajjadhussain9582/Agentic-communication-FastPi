@@ -7,6 +7,7 @@ from sqlmodel import Session, desc, or_, select
 
 from app.api.deps.auth import get_current_user
 from app.core.config import settings
+from app.core.security import verify_session_token
 from app.db.session import get_session
 from app.models.contact import Contact
 from app.models.conversation import Conversation
@@ -69,7 +70,15 @@ class InboundBody(BaseModel):
 
 def _optional_submit_auth(
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
 ):
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[7:]
+        try:
+            verify_session_token(token)
+            return
+        except Exception:
+            pass
     if settings.FORM_SUBMIT_API_KEY and x_api_key != settings.FORM_SUBMIT_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
 

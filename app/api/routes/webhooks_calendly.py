@@ -53,11 +53,14 @@ async def handle_invitee_created(payload: Dict[str, Any], session: Session):
             email=email,
             username=name or email.split("@")[0],
             status="lead",
-            stage="discovery"
+            pipeline_stage="consultation"
         )
-        session.add(contact)
-        session.commit()
-        session.refresh(contact)
+    else:
+        contact.pipeline_stage = "consultation"
+    
+    session.add(contact)
+    session.commit()
+    session.refresh(contact)
     
     # Find or create conversation
     conversation = session.exec(

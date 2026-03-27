@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
-from sqlmodel import Session
+from sqlmodel import Session, select, or_, desc
 
 from app.core.config import settings
 from app.models.contact import Contact
@@ -34,14 +35,39 @@ def process_form_submission(session: Session, form_id: int, body: dict[str, Any]
     channel = str(body.get("channel") or body.get("Channel") or "website")[:100]
     user_text = _extract_user_message(body)
 
-    contact = Contact(
-        email=body.get("email"),
-        username=(body.get("name") or body.get("username")),
-        phone=body.get("phone"),
-        company=body.get("company"),
-        source=f"form:{form_id}",
-        status="new",
-    )
+    email = body.get("email")
+    phone = body.get("phone")
+    username = body.get("name") or body.get("username")
+    company = body.get("company")
+
+    # 1. Match or Create Contact
+    contact = None
+    if email or phone:
+        filters = []
+        if email:
+            filters.append(Contact.email == str(email))
+        if phone:
+            filters.append(Contact.phone == str(phone))
+        if filters:
+            contact = session.exec(select(Contact).where(or_(*filters))).first()
+
+    if not contact:
+        contact = Contact(
+            email=str(email) if email else None,
+            phone=str(phone) if phone else None,
+            username=str(username)[:255] if username else None,
+            company=str(company)[:255] if company else None,
+            source=f"form:{form_id}",
+            status="new",
+        )
+    else:
+        # Update existing contact with fresh info
+        if username:
+            contact.username = str(username)[:255]
+        if company:
+            contact.company = str(company)[:255]
+        contact.updated_at = datetime.utcnow()
+
     session.add(contact)
     session.commit()
     session.refresh(contact)
@@ -55,14 +81,24 @@ def process_form_submission(session: Session, form_id: int, body: dict[str, Any]
     session.commit()
     session.refresh(submission)
 
-    conv = Conversation(
-        contact_id=contact.id,
-        channel=channel,
-        status="open",
-    )
-    session.add(conv)
-    session.commit()
-    session.refresh(conv)
+    # 2. Match or Create Conversation
+    conv = session.exec(
+        select(Conversation)
+        .where(Conversation.contact_id == contact.id)
+        .where(Conversation.channel == channel)
+        .where(Conversation.status == "open")
+        .order_by(desc(Conversation.id))
+    ).first()
+
+    if not conv:
+        conv = Conversation(
+            contact_id=contact.id,
+            channel=channel,
+            status="open",
+        )
+        session.add(conv)
+        session.commit()
+        session.refresh(conv)
 
     inbound = Message(
         conversation_id=conv.id,

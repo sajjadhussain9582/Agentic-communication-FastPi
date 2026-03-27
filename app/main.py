@@ -15,6 +15,9 @@ def create_app():
     @app.on_event("startup")
     def on_startup():
         init_db()
+        from app.services.ai_graph import setup_checkpointer
+        setup_checkpointer()
+        
         from sqlmodel import Session
 
         from app.core.database import engine

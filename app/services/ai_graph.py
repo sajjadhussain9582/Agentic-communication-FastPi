@@ -10,7 +10,12 @@ from typing import Any, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.postgres import PostgresSaver
+from psycopg_pool import ConnectionPool
 from langgraph.graph import END, StateGraph
+from langgraph.types import Command, interrupt
+from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from app.core.config import settings
@@ -27,23 +32,88 @@ from app.services.workflow_engine import run_decision_workflows
 
 logger = logging.getLogger(__name__)
 
+# Global checkpointer for human-in-the-loop interrupts
+_memory_saver = MemorySaver()
+
+# Global connection pool for PostgresSaver
+_pool = None
+
+def get_checkpointer():
+    global _pool
+    if not settings.DATABASE_URL:
+        return _memory_saver
+    
+    if _pool is None:
+        _pool = ConnectionPool(
+            conninfo=settings.DATABASE_URL,
+            min_size=1,
+            max_size=10,
+            kwargs={"autocommit": True, "prepare_threshold": None}
+        )
+    
+    return PostgresSaver(_pool)
+
+def setup_checkpointer():
+    """Initializes the checkpoints table if it doesn't exist."""
+    if not settings.DATABASE_URL:
+        return
+    
+    global _pool
+    if _pool is None:
+        _pool = ConnectionPool(
+            conninfo=settings.DATABASE_URL,
+            min_size=1,
+            max_size=2,
+            kwargs={"autocommit": True, "prepare_threshold": None}
+        )
+    
+    saver = PostgresSaver(_pool)
+    saver.setup()
+    logger.info("LangGraph checkpoints table initialized.")
+
+
+class MessageClassification(BaseModel):
+    """Structured output from the classification node."""
+    role_type: str = Field(description="one of: contractor, agent, developer, architect, builder, unknown")
+    intent_type: str = Field(description="one of: service_inquiry, pricing_request, booking_request, partnership_inquiry, support_request, follow_up, complaint, nurture")
+    relationship_type: str = Field(description="one of: inbound_lead, outbound_prospect, referral_partner, existing_client, dormant_lead, reengaged_lead")
+    decision_role: str = Field(description="one of: decision_maker, influencer, researcher, assistant, unknown")
+    engagement_temperature: str = Field(description="one of: cold, warm, hot")
+    qualification_stage: str = Field(description="one of: discovery, qualified, not_qualified, needs_info")
+    is_escalated: bool = Field(description="True if human intervention is explicitly needed")
+    conversation_status: str = Field(description="one of: open, pending_human, closed")
+    lead_score: float | None = Field(description="number 0-100 or null if unknown")
+    is_qualified: bool | None = Field(description="true if serious client, false if obviously unrelated/spam, null otherwise")
+    budget: str | None = Field(description="budget signal from user")
+    project_type: str | None = Field(description="project type signal from user")
+    timeline: str | None = Field(description="timeline signal from user")
+    project_scope: str | None = Field(description="scope details from user")
+    decision_authority: str | None = Field(description="who makes decisions")
+    geography: str | None = Field(description="location of project")
+    new_pipeline_stage: str = Field(description="The stage the AI decides to move them to (discovery, qualified, proposal_ready, etc.)")
+    close_readiness_score: float = Field(description="number 0-100")
+    requires_action: list[str] = Field(description="List of actions: 'update_status', 'send_calendly', 'send_proposal'")
+    missing_qualification_fields: list[str] = Field(description="Fields still needed: scope, budget, timeline, location, stakeholders")
+    next_best_questions: list[str] = Field(description="1-3 short questions to ask next")
 
 class AgentState(TypedDict, total=False):
+    # Inputs
     user_text: str
     is_proactive: bool
     channel: str
     json_snapshot: str
-    rag_context: str
-    rag_kb_ids: list[int]
-    decision_json: str
-    reply_text: str
     booking_url: str
     conversation_turn: int
     recent_context: str
-    missing_fields: str
-    filled_fields: str
-    estimator_context: str
-    should_include_cta: bool
+    contact_id: int
+    conversation_id: int
+    
+    # Typed Outputs
+    classification: MessageClassification | None
+    rag_chunks: list[dict] | None
+    rag_context: str
+    rag_kb_ids: list[int]
+    generated_reply: str | None
     error: str
 
 PERSONA_POLICIES: dict[str, dict[str, str]] = {
@@ -136,8 +206,8 @@ Rules:
 - Answer primarily from retrieved KB chunks. If the information needed is missing from the excerpts, acknowledge the gap honestly and ask a targeted follow-up question instead of guessing.
 - If retrieval confidence is low (indicated by low scores or no matches), acknowledge uncertainty and suggest a consultation instead of speculating.
 - Do not repeat questions that have already been answered in earlier turns.
-- Always position the company as a connector that introduces vetted partners across contractors, real estate agents, developers, architects, and home builders.
-- Do not claim your team directly provides architecture/design/construction execution.
+- Position the company as a full-service provider that handles design, planning, budgeting, and project execution.
+- Emphasize that we provide the architecture, design, and construction services directly through our internal team and integrated delivery model.
 - Do not use internal platform positioning as the core customer offer (avoid presenting automation/lead-qualification tooling as direct service delivery).
 - If excerpts are missing or insufficient, keep confidence low but still provide a concrete next step.
 - Avoid defensive phrasing such as "we do not handle this" or "we don't provide that."
@@ -188,35 +258,10 @@ User message:
 {user_text}
 """
 
-def _parse_decision(raw: str) -> dict[str, Any]:
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    return json.loads(raw)
-
-
 def _safe_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(v).strip() for v in value if str(v).strip()]
     return []
-
-
-def should_include_cta(
-    *,
-    conversation_turn: int,
-    cta_readiness_score: int | float | None,
-    missing_fields: list[str],
-    conversation_stage: str | None,
-) -> bool:
-    if conversation_turn <= 1:
-        return True
-    stage = (conversation_stage or "").strip().lower()
-    score = float(cta_readiness_score or 0)
-    if stage in {"proposal_ready", "close_ready"}:
-        return True
-    if score >= 70 and len(missing_fields) <= 2:
-        return True
-    return False
 
 
 def _build_recent_context(session: Session, conversation_id: int, limit: int = 4) -> str:
@@ -306,133 +351,110 @@ def build_graph(session: Session):
         temperature=0.2,
     )
 
-    def node_retrieve(state: AgentState) -> dict[str, Any]:
+    def node_classify(state: AgentState) -> Command:
+        structured_llm = llm.with_structured_output(MessageClassification)
+        prompt = DECISION_PROMPT.format(
+            json_snapshot=state.get("json_snapshot", "{}"),
+            user_text=state.get("user_text", ""),
+            rag_context="",
+        )
+        try:
+            classification = structured_llm.invoke([HumanMessage(content=prompt)])
+            if classification.is_escalated:
+                return Command(update={"classification": classification}, goto="human_review")
+            elif "update_status" in (classification.requires_action or []):
+                return Command(update={"classification": classification}, goto="update_status")
+            else:
+                return Command(update={"classification": classification}, goto="retrieve")
+        except Exception as e:
+            logger.error(f"Classification error: {e}")
+            return Command(goto="retrieve")
+
+    def node_retrieve(state: AgentState) -> Command:
         q = state.get("user_text", "")[:8000]
-        # Phase 6: Hybrid routing — detect category from keywords first
         routed_category = detect_category(q)
         chunks, kb_ids = search_similar(
             session, q, top_k=5, min_score=0.35, category=routed_category,
         )
-        # Confidence cutoff: if best score is low, flag it
-        low_confidence = False
-        if chunks and chunks[0].score < 0.40:
-            low_confidence = True
-            logger.warning(
-                "Low-confidence retrieval: best_score=%.3f query='%s'",
-                chunks[0].score, q[:60],
-            )
         rag_ctx = format_rag_context(chunks)
-        if low_confidence:
-            rag_ctx += "\n\n(NOTE: Retrieval confidence is LOW. Prefer asking a clarifying question over speculating.)"
-        return {
-            "rag_context": rag_ctx,
-            "rag_kb_ids": kb_ids,
-        }
-
-    def node_decide(state: AgentState) -> dict[str, Any]:
-        prompt = DECISION_PROMPT.format(
-            json_snapshot=state.get("json_snapshot", "{}"),
-            user_text=state.get("user_text", ""),
-            rag_context=state.get("rag_context", ""),
+        return Command(
+            update={"rag_context": rag_ctx, "rag_kb_ids": kb_ids},
+            goto="draft"
         )
-        out = llm.invoke([HumanMessage(content=prompt)])
-        text = out.content if hasattr(out, "content") else str(out)
-        try:
-            d = _parse_decision(text)
-            missing_fields = _safe_list(d.get("missing_fields"))
-            filled_fields = _safe_list(d.get("filled_fields"))
-            conversation_stage = str(d.get("conversation_stage") or "discovery")
-            include_cta = should_include_cta(
-                conversation_turn=int(state.get("conversation_turn", 1)),
-                cta_readiness_score=d.get("cta_readiness_score"),
-                missing_fields=missing_fields,
-                conversation_stage=conversation_stage,
-            )
-            return {
-                "decision_json": json.dumps(d),
-                "missing_fields": ", ".join(missing_fields),
-                "filled_fields": ", ".join(filled_fields),
-                "should_include_cta": include_cta,
-            }
-        except json.JSONDecodeError:
-            return {
-                "decision_json": json.dumps(
-                    {
-                        "last_intent": "unknown",
-                        "persona_segment": "unknown",
-                        "qualification_stage": "needs_info",
-                        "conversation_stage": "discovery",
-                        "missing_fields": ["scope", "budget", "timeline", "location", "stakeholders"],
-                        "next_best_questions": ["Could you share the project scope and timeline?"],
-                        "cta_readiness_score": 30,
-                        "is_escalated": False,
-                        "conversation_status": "open",
-                    }
-                ),
-                "missing_fields": "scope, budget, timeline, location, stakeholders",
-                "filled_fields": "",
-                "should_include_cta": False,
-            }
 
-    def node_reply(state: AgentState) -> dict[str, Any]:
-        decision_obj: dict[str, Any] = {}
-        try:
-            decision_obj = json.loads(state.get("decision_json", "{}"))
-        except json.JSONDecodeError:
-            decision_obj = {}
-        role_type = str(decision_obj.get("role_type") or decision_obj.get("persona_segment") or "unknown")
-        if role_type not in PERSONA_POLICIES:
-            role_type = "unknown"
-        persona_policy = PERSONA_POLICIES[role_type]
-        conversation_turn = int(state.get("conversation_turn", 1))
-        missing_fields = state.get("missing_fields", "")
-        filled_fields = state.get("filled_fields", "")
-        include_cta = bool(state.get("should_include_cta", True))
-        cta_policy = (
-            "Include CTA naturally with one concrete next step."
-            if include_cta
-            else "Do not include meeting CTA this turn; continue discovery naturally."
-        )
+    def node_update_status(state: AgentState) -> Command:
+        classification = state.get("classification")
+        if classification and classification.new_pipeline_stage:
+            contact_id = state.get("contact_id")
+            if contact_id:
+                contact = session.get(Contact, contact_id)
+                if contact:
+                    contact.pipeline_stage = classification.new_pipeline_stage
+                    session.add(contact)
+                    session.commit()
+                    logger.info(f"Updated contact {contact_id} stage to {classification.new_pipeline_stage}")
+        return Command(goto="retrieve")
+
+    def node_draft(state: AgentState) -> Command:
+        classification = state.get("classification")
+        stage = classification.new_pipeline_stage if classification else "discovery"
+        
+        # Stage-driven prompt logic
+        persona_segment = classification.intent_type if classification else "unknown"
+        if persona_segment not in PERSONA_POLICIES:
+            persona_segment = "unknown"
+        persona_policy = PERSONA_POLICIES[persona_segment]
+
+        # Customize instruction based on stage
+        stage_instruction = ""
+        if stage == "discovery":
+            stage_instruction = "Ask for missing budget/timeline/scope. DO NOT send the Calendly link yet."
+        elif stage == "qualified":
+            stage_instruction = "The lead is qualified. Propose a consultation and provide the Calendly link."
+        elif stage == "proposal_ready":
+            stage_instruction = "Confirm details and mention an email proposal is being prepared. Ask for their best email."
 
         prompt = REPLY_PROMPT.format(
             channel=state.get("channel", "website"),
-            relationship_type=decision_obj.get("relationship_type", "unknown"),
-            engagement_temperature=decision_obj.get("engagement_temperature", "warm"),
-            decision_role=decision_obj.get("decision_role", "unknown"),
+            relationship_type="inbound_lead", # Default
+            engagement_temperature="warm",
+            decision_role="decision_maker",
             rag_context=state.get("rag_context", ""),
-            decision_json=state.get("decision_json", "{}"),
+            decision_json=json.dumps(classification.model_dump()) if classification else "{}",
             user_text=state.get("user_text", ""),
             booking_url=state.get("booking_url", ""),
-            persona_segment=role_type,
-            role_type=role_type,
+            persona_segment=persona_segment,
+            role_type=persona_segment,
             persona_policy=json.dumps(persona_policy),
-            conversation_turn=conversation_turn,
+            conversation_turn=state.get("conversation_turn", 1),
             recent_context=state.get("recent_context", ""),
-            missing_fields=missing_fields,
-            filled_fields=filled_fields,
+            missing_fields=", ".join(classification.missing_qualification_fields) if classification else "",
+            filled_fields=state.get("filled_fields", ""),
             estimator_context=state.get("estimator_context", ""),
-            cta_policy=cta_policy,
+            cta_policy=stage_instruction,
         )
-        out = llm.invoke(
-            [
-                SystemMessage(
-                    content="You write clear, business-professional client replies. No markdown code fences."
-                ),
-                HumanMessage(content=prompt),
-            ]
-        )
+        
+        out = llm.invoke([
+            SystemMessage(content="You write clear, business-professional client replies. No markdown code fences."),
+            HumanMessage(content=prompt)
+        ])
         reply = out.content if hasattr(out, "content") else str(out)
-        return {"reply_text": (reply or "").strip()}
+        return Command(update={"generated_reply": reply.strip()}, goto=END)
+
+    def node_human_review(state: AgentState) -> Command:
+        interrupt("Human intervention required. Escalated by AI.")
+        return Command(goto="retrieve")
 
     g = StateGraph(AgentState)
+    g.add_node("classify", node_classify)
     g.add_node("retrieve", node_retrieve)
-    g.add_node("decide", node_decide)
-    g.add_node("reply", node_reply)
-    g.set_entry_point("retrieve")
-    g.add_edge("retrieve", "decide")
-    g.add_edge("decide", "reply")
-    g.add_edge("reply", END)
-    return g.compile()
+    g.add_node("update_status", node_update_status)
+    g.add_node("draft", node_draft)
+    g.add_node("human_review", node_human_review)
+    
+    g.set_entry_point("classify")
+    
+    return g.compile(checkpointer=get_checkpointer())
 
 
 def run_ai_pipeline(
@@ -473,84 +495,81 @@ def run_ai_pipeline(
         "booking_url": settings.CALENDLY_BOOKING_URL or "",
         "conversation_turn": max(1, conversation_turn),
         "recent_context": recent_context,
-        "missing_fields": "",
         "filled_fields": ", ".join(sorted(slots.keys())),
         "estimator_context": estimator_context,
-        "should_include_cta": True,
+        "contact_id": contact.id,
+        "conversation_id": conversation.id,
     }
-    final = graph.invoke(initial)
+    config = {"configurable": {"thread_id": str(conversation.id)}}
+    
+    # Execute graph
+    final = graph.invoke(initial, config)
+    
+    classification = final.get("classification")
+    
+    # Update conversation based on classification
+    if classification:
+        conversation.last_intent = str(classification.intent_type)[:500]
+        conversation.is_escalated = bool(classification.is_escalated)
+        conversation.status = str(classification.conversation_status or "open")[:100]
+        
+        # Redundant sync for safety
+        sync_pipeline_stage(session, contact, classification.model_dump())
 
-    decision = {}
-    try:
-        decision = json.loads(final.get("decision_json") or "{}")
-    except json.JSONDecodeError:
-        pass
+        if classification.new_pipeline_stage:
+            contact.pipeline_stage = classification.new_pipeline_stage
+            
+        if classification.lead_score is not None:
+            try:
+                contact.lead_score = Decimal(str(classification.lead_score))
+            except Exception:
+                pass
+        if classification.is_qualified is not None:
+            contact.is_qualified = bool(classification.is_qualified)
+        
+        # Update contact fields
+        for fld in ("budget", "project_type", "timeline"):
+            v = getattr(classification, fld)
+            if v is not None and str(v).strip():
+                setattr(contact, fld, str(v)[:2000])
 
-    conversation.last_intent = str(decision.get("intent_type") or decision.get("last_intent") or "unknown")[:500]
-    conversation.is_escalated = bool(decision.get("is_escalated"))
-    conversation.status = str(decision.get("conversation_status") or "open")[:100]
     from datetime import datetime
-
     conversation.updated_at = datetime.utcnow()
 
-    # Apply V2 Governed Pipeline Sync
-    sync_pipeline_stage(session, contact, decision)
-
-    if decision.get("lead_score") is not None:
-        try:
-            contact.lead_score = Decimal(str(decision["lead_score"]))
-        except Exception:
-            pass
-    if decision.get("is_qualified") is not None:
-        contact.is_qualified = bool(decision["is_qualified"])
-    for fld, key in (
-        ("budget", "budget"),
-        ("project_type", "project_type"),
-        ("timeline", "timeline"),
-    ):
-        v = decision.get(key)
-        if v is not None and str(v).strip():
-            setattr(contact, fld, str(v)[:2000])
-
-    missing_fields = _safe_list(decision.get("missing_fields"))
-    conversation_stage = str(decision.get("conversation_stage") or "discovery")
-    cta_readiness_score = decision.get("cta_readiness_score")
-    close_readiness_score = decision.get("close_readiness_score")
-    next_action = str(decision.get("next_action") or "ask_missing_info")
-    include_cta = should_include_cta(
-        conversation_turn=max(1, conversation_turn),
-        cta_readiness_score=cta_readiness_score,
-        missing_fields=missing_fields,
-        conversation_stage=conversation_stage,
-    )
-
-    # 3. Governance Layer (V2 Action Approval Matrix)
-    # Filter the AI's requested action against our coded business policies.
+    # Governance & Metrics
+    next_action = "ask_missing_info"
+    if classification:
+        if "send_calendly" in classification.requires_action:
+            next_action = "book_consultation"
+        elif "send_proposal" in classification.requires_action:
+            next_action = "send_proposal"
+            
     if not validate_action(contact, next_action):
-        next_action = "ask_missing_info" # Fallback to safe action
-        logger.warning(f"Governance restricted AI from taking action: {decision.get('next_action')}")
+        next_action = "ask_missing_info"
+        logger.warning(f"Governance restricted AI from taking action: {next_action}")
 
     if next_action == "book_consultation":
         record_outcome(session, contact.id, "booking_intent")
-    # Persist lightweight state for turn-aware behavior in future messages.
+
+    # Persist lightweight state
     ext = contact.external_ids if isinstance(contact.external_ids, dict) else {}
-    ext["ai_state"] = {
-        "conversation_stage": conversation_stage,
-        "missing_fields": missing_fields,
-        "filled_fields": _safe_list(decision.get("filled_fields")),
-        "next_best_questions": _safe_list(decision.get("next_best_questions")),
-        "cta_readiness_score": cta_readiness_score,
-        "close_readiness_score": close_readiness_score,
-        "next_action": next_action,
-    }
+    if classification:
+        ext["ai_state"] = {
+            "conversation_stage": classification.new_pipeline_stage,
+            "missing_fields": classification.missing_qualification_fields,
+            "filled_fields": _safe_list(slots.keys()),
+            "next_action": next_action,
+        }
     ext["slots"] = slots
     contact.external_ids = ext
     contact.updated_at = datetime.utcnow()
+
+    # Run workflows
     run_decision_workflows(
         session,
         conversation=conversation,
         contact=contact,
-        decision=decision,
+        decision=classification.model_dump() if classification else {},
     )
 
     session.add(conversation)
@@ -564,7 +583,7 @@ def run_ai_pipeline(
         sender_id=None,
         message_type="text",
         message=(
-            final.get("reply_text")
+            final.get("generated_reply")
             or (
                 "Thanks for sharing those details. "
                 "Could you also share your target timeline and budget range so we can map the right partner fit?"
@@ -581,17 +600,18 @@ def run_ai_pipeline(
         session.add(inbound_message)
     session.commit()
     session.refresh(outbound)
+    
     _log_reply_quality(
-        decision=decision,
+        classification=classification,
         reply_text=outbound.message,
         conversation_turn=max(1, conversation_turn),
-        include_cta=include_cta,
+        include_cta=True, # Default to true for logging
     )
     return outbound
 
 
 def _log_reply_quality(
-    decision: dict[str, Any],
+    classification: MessageClassification | None,
     reply_text: str,
     conversation_turn: int,
     include_cta: bool,
@@ -602,10 +622,14 @@ def _log_reply_quality(
         token in lower for token in ("scope", "budget", "timeline", "location", "decision")
     )
     has_defensive_phrase = ("we don't" in lower) or ("we do not" in lower)
+    
+    role = classification.role_type if classification else "unknown"
+    intent = classification.intent_type if classification else "unknown"
+    
     logger.info(
-        "reply_quality persona=%s intent=%s turn=%s cta_policy=%s cta_present=%s qualification_prompts_present=%s defensive_phrase=%s",
-        decision.get("persona_segment", "unknown"),
-        decision.get("last_intent", "unknown"),
+        "reply_quality role=%s intent=%s turn=%s cta_policy=%s cta_present=%s qualification_prompts_present=%s defensive_phrase=%s",
+        role,
+        intent,
         conversation_turn,
         include_cta,
         has_cta,

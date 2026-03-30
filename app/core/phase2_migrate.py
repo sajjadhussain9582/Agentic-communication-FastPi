@@ -95,7 +95,7 @@ def backfill_uuids(session: Session) -> None:
 def ensure_default_integrations(session: Session) -> None:
     from app.models.integration import Integration
 
-    for provider in ("ghl", "email", "sms", "website", "workflow", "calendar"):
+    for provider in ("ghl", "email", "sms", "website", "workflow", "calendar", "hubspot"):
         row = session.exec(select(Integration).where(Integration.provider == provider)).first()
         if not row:
             session.add(Integration(provider=provider, status="disconnected"))

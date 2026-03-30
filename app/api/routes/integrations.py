@@ -1,10 +1,15 @@
+import logging
+import urllib.parse
 from datetime import datetime
 from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from sqlmodel import Session, select
+
+logger = logging.getLogger(__name__)
 
 from app.api.deps.auth import get_current_user
 from app.core.config import settings
@@ -12,6 +17,7 @@ from app.db.session import get_session
 from app.models.integration import Integration, IntegrationRun
 from app.models.user import User
 from app.schemas.integration import EmailConfigSMTP, EmailConfigResend, CalendlyConfig
+from app.services.integrations.hubspot_client import HubSpotClient
 
 router = APIRouter(prefix="/integrations", tags=["Integrations"])
 
@@ -244,3 +250,46 @@ def list_integration_runs(
         )
         for r in runs
     ]
+
+
+@router.get("/hubspot/authorize")
+def authorize_hubspot():
+    """Redirects the user to HubSpot's OAuth consent screen."""
+    if not settings.HUBSPOT_CLIENT_ID:
+        raise HTTPException(400, "HUBSPOT_CLIENT_ID not configured")
+
+    scopes = [
+        "crm.objects.contacts.read",
+        "crm.objects.contacts.write",
+        "crm.objects.owners.read",
+        "crm.schemas.contacts.read",
+        "crm.schemas.contacts.write",
+
+    ]
+    
+    params = {
+        "client_id": settings.HUBSPOT_CLIENT_ID,
+        "redirect_uri": settings.HUBSPOT_REDIRECT_URI,
+        "scope": " ".join(scopes),
+    }
+    
+    auth_url = "https://app.hubspot.com/oauth/authorize?" + urllib.parse.urlencode(params)
+    return RedirectResponse(auth_url)
+
+
+@router.get("/hubspot/callback")
+async def hubspot_callback(
+    code: str,
+    session: Session = Depends(get_session),
+):
+    """Handles the OAuth callback from HubSpot."""
+    client = HubSpotClient(session)
+    try:
+        await client.exchange_code_for_tokens(code)
+        # Redirect back to the frontend integration page
+        frontend_url = settings.FRONTEND_URL or "http://localhost:3000"
+        return RedirectResponse(f"{frontend_url}/settings/integrations?status=success&provider=hubspot")
+    except Exception as e:
+        logger.error(f"HubSpot OAuth error: {str(e)}")
+        frontend_url = settings.FRONTEND_URL or "http://localhost:3000"
+        return RedirectResponse(f"{frontend_url}/settings/integrations?status=error&provider=hubspot&message={urllib.parse.quote(str(e))}")

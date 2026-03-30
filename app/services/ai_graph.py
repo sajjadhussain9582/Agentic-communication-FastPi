@@ -122,7 +122,7 @@ class AgentState(TypedDict, total=False):
 PERSONA_POLICIES: dict[str, dict[str, str]] = {
     "contractor": {
         "focus": "assess if they are a potential partner or service buyer; understand project pipeline, subcontracting needs, and urgency",
-        "questions": "are you looking for leads or services, project size, service area, current challenges, timeline and budget context",
+        "questions": "are you looking for leads or services, project ssize, service area, current challenges, timeline and budget context",
         "cta": "If partner-fit, offer a partnership alignment call; if project-fit, guide toward consultation booking with clear next steps.",
     },
     "agent": {

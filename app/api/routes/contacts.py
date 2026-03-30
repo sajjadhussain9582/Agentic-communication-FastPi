@@ -2,7 +2,7 @@ import re
 from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from sqlmodel import Session, desc, select
 
@@ -208,9 +208,10 @@ def get_contact(
 
 
 @router.patch("/{contact_uuid}", response_model=ContactDetailRead)
-def patch_contact(
+async def patch_contact(
     contact_uuid: str,
     body: ContactPatchBody,
+    background_tasks: BackgroundTasks,
     _: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
@@ -245,4 +246,9 @@ def patch_contact(
     session.add(c)
     session.commit()
     session.refresh(c)
+
+    # Trigger HubSpot sync in background
+    from app.services.worker import sync_single_contact_to_hubspot_task
+    background_tasks.add_task(sync_single_contact_to_hubspot_task, c.id)
+
     return _contact_detail(session, c)

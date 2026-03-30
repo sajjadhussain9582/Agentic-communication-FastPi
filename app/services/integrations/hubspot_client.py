@@ -123,3 +123,35 @@ class HubSpotClient:
                 logger.error(f"Failed to create HubSpot contact: {response.text}")
                 return {"ok": False, "error": response.text}
             return {"ok": True, "data": response.json()}
+
+    async def upsert_contact(self, email: str, properties: Dict[str, Any]) -> Dict[str, Any]:
+        """Creates or updates a contact in HubSpot using email as the unique identifier."""
+        token = await self.get_valid_access_token()
+        
+        # HubSpot's batch upsert endpoint is often the most robust way to do this
+        # but for a single contact, we can also use the search + update/create pattern
+        # or the specific 'upsert' behavior if available in newer v3 endpoints.
+        # Here we use the Batch Upsert pattern for robustness.
+        
+        payload = {
+            "inputs": [
+                {
+                    "idProperty": "email",
+                    "id": email,
+                    "properties": properties
+                }
+            ]
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{HUBSPOT_API_BASE}/crm/v3/objects/contacts/batch/upsert",
+                headers={"Authorization": f"Bearer {token}"},
+                json=payload
+            )
+            
+            if response.status_code not in (200, 201):
+                logger.error(f"HubSpot upsert failed: {response.text}")
+                return {"ok": False, "error": response.text}
+            
+            return {"ok": True, "data": response.json()}

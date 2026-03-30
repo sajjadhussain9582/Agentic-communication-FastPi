@@ -67,11 +67,25 @@ Use the existing disconnect endpoint to remove the connection.
 
 **Request:** `POST /api/v1/integrations/hubspot/disconnect`
 
-## 3. Scopes Used
+### **Manual Contact Sync**
+If you want to provide a "Sync to HubSpot" button on a specific contact's detail page:
+
+**Request:** `POST /api/v1/integrations/hubspot/sync/{contact_uuid}`
+
+---
+
+## 3. Automated Syncing
+The backend runs a background worker every **5 minutes** that automatically:
+1.  Finds any contacts in the database that don't have a `hubspot_id` in their `external_ids`.
+2.  Creates or updates (upserts) them in HubSpot using their email as the unique identifier.
+3.  Saves the returned `hubspot_id` back to the contact's `external_ids`.
+
+## 4. Scopes Used
 The backend is configured to request the following scopes:
 - `crm.objects.contacts.read`
 - `crm.objects.contacts.write`
 - `crm.objects.owners.read`
 - `crm.schemas.contacts.read`
+- `crm.schemas.contacts.write`
 
 Ensure your HubSpot app has these scopes enabled in the **HubSpot Developer Portal**.

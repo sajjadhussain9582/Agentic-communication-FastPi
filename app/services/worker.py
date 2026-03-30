@@ -1,5 +1,6 @@
 import logging
 import asyncio
+from email.utils import parseaddr
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlmodel import Session, select
@@ -13,8 +14,100 @@ from app.services.pipeline_manager import detect_sla_violation
 from app.services.nurture import run_nurture_audit
 from app.services.imap_service import fetch_new_emails
 from app.services.intake_service import process_inbound_message
+from app.services.integrations.hubspot_client import HubSpotClient
 
 logger = logging.getLogger(__name__)
+
+def sync_contacts_to_hubspot():
+    """Find contacts that have been modified and push them to HubSpot."""
+    with Session(engine) as session:
+        # Check if HubSpot is connected
+        integration = session.exec(
+            select(Integration).where(Integration.provider == "hubspot", Integration.status == "connected")
+        ).first()
+        
+        if not integration:
+            return
+
+        # Fetch all contacts. We use upsert so it's safe to sync everything
+        contacts = session.exec(select(Contact)).all()
+        if not contacts:
+            return
+
+        logger.info(f"Worker: Checking {len(contacts)} contacts for HubSpot sync.")
+        _perform_hubspot_sync(session, contacts)
+
+def sync_single_contact_to_hubspot_task(contact_id: int):
+    """Background task to sync a single contact immediately."""
+    with Session(engine) as session:
+        contact = session.get(Contact, contact_id)
+        if contact:
+            _perform_hubspot_sync(session, [contact])
+
+def _perform_hubspot_sync(session: Session, contacts: list[Contact]):
+    hubspot = HubSpotClient(session)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # HubSpot property mappings
+    STATUS_MAP = {
+        "new": "NEW",
+        "active": "OPEN",
+        "stale": "ATTEMPTED_TO_CONTACT",
+        "qualified": "OPEN_DEAL",
+        "unqualified": "UNQUALIFIED",
+        "lost": "UNQUALIFIED"
+    }
+    
+    STAGE_MAP = {
+        "discovery": "lead",
+        "qualified": "marketingqualifiedlead",
+        "proposal_ready": "salesqualifiedlead",
+        "negotiation": "opportunity",
+        "won": "customer",
+        "lost": "other"
+    }
+    
+    try:
+        for c in contacts:
+            try:
+                _, clean_email = parseaddr(c.email)
+                if not clean_email:
+                    continue
+
+                # Translate internal values to HubSpot options
+                hs_status = STATUS_MAP.get((c.status or "new").lower(), "NEW")
+                hs_lifecycle = STAGE_MAP.get((c.pipeline_stage or "discovery").lower(), "lead")
+
+                props = {
+                    "email": clean_email,
+                    "firstname": c.username.split(" ")[0] if c.username else "Unknown",
+                    "lastname": " ".join(c.username.split(" ")[1:]) if c.username and " " in c.username else "",
+                    "phone": c.phone,
+                    "company": c.company,
+                    "lifecyclestage": hs_lifecycle,
+                    "hs_lead_status": hs_status
+                }
+                
+                res = loop.run_until_complete(hubspot.upsert_contact(clean_email, props))
+                
+                if res.get("ok"):
+                    results = res.get("data", {}).get("results", [])
+                    if results:
+                        hs_id = results[0].get("id")
+                        if not c.external_ids:
+                            c.external_ids = {}
+                        c.external_ids["hubspot_id"] = hs_id
+                        session.add(c)
+                        logger.info(f"HubSpot Sync: Success for {clean_email} (ID: {hs_id})")
+                else:
+                    logger.error(f"HubSpot Sync: Failed for {c.email}: {res.get('error')}")
+            except Exception as e:
+                logger.error(f"HubSpot Sync: Error for contact {c.id}: {e}")
+        
+        session.commit()
+    finally:
+        loop.close()
 
 def check_incoming_emails():
     """Fetch new emails from the IMAP server and process them."""
@@ -155,5 +248,6 @@ def start_worker():
     scheduler.add_job(check_incoming_emails, 'interval', seconds=60, id='check_incoming_emails')
     scheduler.add_job(check_queued_messages, 'interval', minutes=1, id='check_queued_messages')
     scheduler.add_job(check_stale_leads, 'interval', minutes=3, id='check_stale_leads')
+    scheduler.add_job(sync_contacts_to_hubspot, 'interval', minutes=5, id='sync_contacts_to_hubspot')
     scheduler.start()
     logger.info("Background worker initialized and started.")

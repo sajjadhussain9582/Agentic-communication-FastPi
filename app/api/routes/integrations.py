@@ -1,5 +1,6 @@
 import logging
 import urllib.parse
+from email.utils import parseaddr
 from datetime import datetime
 from typing import Optional
 
@@ -293,3 +294,75 @@ async def hubspot_callback(
         logger.error(f"HubSpot OAuth error: {str(e)}")
         frontend_url = settings.FRONTEND_URL or "http://localhost:3000"
         return RedirectResponse(f"{frontend_url}/settings/integrations?status=error&provider=hubspot&message={urllib.parse.quote(str(e))}")
+
+
+@router.post("/hubspot/sync/{contact_uuid}")
+async def sync_contact_to_hubspot_manual(
+    contact_uuid: str,
+    _: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Manually push a specific contact to HubSpot."""
+    from app.models.contact import Contact
+    contact = session.exec(select(Contact).where(Contact.public_uuid == contact_uuid)).first()
+    if not contact:
+        raise HTTPException(404, "Contact not found")
+
+    if not contact.email:
+        raise HTTPException(400, "Contact must have an email to sync to HubSpot")
+
+    # Extract clean email (handle "Name <email@..." format)
+    _, clean_email = parseaddr(contact.email)
+    if not clean_email:
+        raise HTTPException(400, f"No valid email address found in '{contact.email}'")
+
+    # HubSpot property mappings
+    STATUS_MAP = {
+        "new": "NEW",
+        "active": "OPEN",
+        "stale": "ATTEMPTED_TO_CONTACT",
+        "qualified": "OPEN_DEAL",
+        "unqualified": "UNQUALIFIED",
+        "lost": "UNQUALIFIED"
+    }
+    
+    STAGE_MAP = {
+        "discovery": "lead",
+        "qualified": "marketingqualifiedlead",
+        "proposal_ready": "salesqualifiedlead",
+        "negotiation": "opportunity",
+        "won": "customer",
+        "lost": "other"
+    }
+
+    hs_status = STATUS_MAP.get((contact.status or "new").lower(), "NEW")
+    hs_lifecycle = STAGE_MAP.get((contact.pipeline_stage or "discovery").lower(), "lead")
+
+    hubspot = HubSpotClient(session)
+    props = {
+        "email": clean_email,
+        "firstname": contact.username.split(" ")[0] if contact.username else "Unknown",
+        "lastname": " ".join(contact.username.split(" ")[1:]) if contact.username and " " in contact.username else "",
+        "phone": contact.phone,
+        "company": contact.company,
+        "lifecyclestage": hs_lifecycle,
+        "hs_lead_status": hs_status
+    }
+
+    try:
+        res = await hubspot.upsert_contact(clean_email, props)
+        if res.get("ok"):
+            results = res.get("data", {}).get("results", [])
+            if results:
+                hs_id = results[0].get("id")
+                if not contact.external_ids:
+                    contact.external_ids = {}
+                contact.external_ids["hubspot_id"] = hs_id
+                session.add(contact)
+                session.commit()
+                return {"ok": True, "hubspot_id": hs_id}
+        else:
+            raise HTTPException(500, f"HubSpot sync failed: {res.get('error')}")
+    except Exception as e:
+        logger.error(f"HubSpot manual sync error: {str(e)}")
+        raise HTTPException(500, f"Internal error during sync: {str(e)}")

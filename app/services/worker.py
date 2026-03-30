@@ -7,11 +7,40 @@ from app.core.database import engine
 from app.models.campaign import CampaignMessageRow, CampaignTarget
 from app.models.contact import Contact
 from app.models.conversation import Conversation
+from app.models.integration import Integration
 from app.services.channel_delivery import deliver_message
 from app.services.pipeline_manager import detect_sla_violation
 from app.services.nurture import run_nurture_audit
+from app.services.imap_service import fetch_new_emails
+from app.services.intake_service import process_inbound_message
 
 logger = logging.getLogger(__name__)
+
+def check_incoming_emails():
+    """Fetch new emails from the IMAP server and process them."""
+    with Session(engine) as session:
+        integration = session.exec(
+            select(Integration).where(Integration.provider == "email", Integration.status == "connected")
+        ).first()
+        
+        if not integration or not integration.config_json:
+            return
+
+        config = integration.config_json
+        if config.get("type") != "smtp": # For now, only support smtp for imap
+            return
+
+        new_messages = fetch_new_emails(config)
+        if not new_messages:
+            return
+
+        logger.info(f"Worker: Found {len(new_messages)} new emails to process.")
+        for msg in new_messages:
+            try:
+                sender_details = {"email": msg["from"], "name": msg["from"]}
+                asyncio.run(process_inbound_message(session, "email", sender_details, msg["body"], msg["subject"]))
+            except Exception as e:
+                logger.error(f"Worker: Error processing incoming email: {e}")
 
 def check_queued_messages():
     """Find and send queued campaign messages."""
@@ -123,6 +152,7 @@ scheduler = BackgroundScheduler()
 
 def start_worker():
     # Low frequency for stability
+    scheduler.add_job(check_incoming_emails, 'interval', seconds=60, id='check_incoming_emails')
     scheduler.add_job(check_queued_messages, 'interval', minutes=1, id='check_queued_messages')
     scheduler.add_job(check_stale_leads, 'interval', minutes=3, id='check_stale_leads')
     scheduler.start()

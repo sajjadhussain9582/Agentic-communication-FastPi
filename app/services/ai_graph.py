@@ -22,6 +22,7 @@ from app.core.config import settings
 from app.models.contact import Contact
 from app.models.conversation import Conversation
 from app.models.message import Message
+from app.models.pipeline_stage import PipelineStage
 from app.services.estimator import estimate_project
 from app.services.kb_router import detect_category
 from app.services.kb_rag import format_rag_context, search_similar
@@ -107,6 +108,8 @@ class AgentState(TypedDict, total=False):
     recent_context: str
     contact_id: int
     conversation_id: int
+    contact_name: str
+    agent_name: str
     
     # Typed Outputs
     classification: MessageClassification | None
@@ -202,6 +205,8 @@ Knowledge base excerpts (may be empty):
 REPLY_PROMPT = """You are a professional client-facing partnership assistant. Write ONE polished reply email/message.
 
 Rules:
+- NEVER use generic placeholders like "[Name]", "[Your Name]", "[City]", or any text inside brackets [ ]. 
+- Use the actual names provided below. If a name is unknown, use a warm but professional generic greeting (e.g., "Hi there," or just "Hi,").
 - Ground factual claims ONLY in the FAQ/knowledge excerpts below. If something is not in the excerpts, do not make up policies, prices, or guarantees.
 - Answer primarily from retrieved KB chunks. If the information needed is missing from the excerpts, acknowledge the gap honestly and ask a targeted follow-up question instead of guessing.
 - If retrieval confidence is low (indicated by low scores or no matches), acknowledge uncertainty and suggest a consultation instead of speculating.
@@ -213,8 +218,7 @@ Rules:
 - Avoid defensive phrasing such as "we do not handle this" or "we don't provide that."
 
 Turn behavior:
-- If context indicates a proactive system nudge: write a warm re-engagement message. Do not assume they just messaged you. Reference their previous project context naturally and ask if they have any updates or need a partner introduction.
-- If conversation_turn == 1: use a short greeting and opening.
+- If conversation_turn == 1: use a short greeting (e.g., "Hi {contact_name},") and opening.
 - If conversation_turn > 1: do not repeat greeting/signature; continue naturally from prior context.
 - Do not end every message with a meeting ask.
 - Ask only the next best 1-2 questions from missing_fields/next_best_questions.
@@ -224,6 +228,10 @@ Turn behavior:
 - If stage is proposal_ready or close_ready, prioritize close action (shortlist, proposal, or booking) over new discovery questions.
 - Briefly reference the user's latest details naturally.
 - If user asks for partner contact details directly, do not dump raw personal phone/email data. Offer curated shortlist + warm intro workflow.
+
+Signature:
+- Sign off naturally as {agent_name} if this is the first turn or a full email format is expected. Otherwise, skip the signature.
+- Do not use "[Your Name]" in the signature.
 
 Tone:
 - Executive, clear, warm, concise, and human-like.
@@ -236,6 +244,8 @@ Tone:
 
 Context:
 - Channel context (Email vs SMS vs Website): {channel}
+- Contact name: {contact_name}
+- Agent/Sender name: {agent_name}
 - Role type: {role_type}
 - Relationship context (Inbound vs Outbound vs Referral): {relationship_type}
 - Engagement temperature (Cold vs Warm vs Hot): {engagement_temperature}
@@ -352,12 +362,20 @@ def build_graph(session: Session):
     )
 
     def node_classify(state: AgentState) -> Command:
+        # Fetch dynamic stages from DB
+        stages = list(session.exec(select(PipelineStage).order_by(PipelineStage.order_index)).all())
+        stage_info = "\n".join([f"- {s.key}: {s.ai_instructions}" for s in stages])
+        valid_keys = ", ".join([s.key for s in stages])
+
         structured_llm = llm.with_structured_output(MessageClassification)
         prompt = DECISION_PROMPT.format(
             json_snapshot=state.get("json_snapshot", "{}"),
             user_text=state.get("user_text", ""),
             rag_context="",
         )
+        # Inject dynamic stages into prompt
+        prompt += f"\n\nAVAILABLE PIPELINE STAGES:\n{stage_info}\n\nRule: new_pipeline_stage MUST be one of: {valid_keys}"
+
         try:
             classification = structured_llm.invoke([HumanMessage(content=prompt)])
             if classification.is_escalated:
@@ -389,7 +407,16 @@ def build_graph(session: Session):
             if contact_id:
                 contact = session.get(Contact, contact_id)
                 if contact:
+                    # Update both the string field and the foreign key
                     contact.pipeline_stage = classification.new_pipeline_stage
+                    
+                    # Find the stage record to link by ID
+                    stage_record = session.exec(
+                        select(PipelineStage).where(PipelineStage.key == classification.new_pipeline_stage)
+                    ).first()
+                    if stage_record:
+                        contact.pipeline_stage_id = stage_record.id
+                        
                     session.add(contact)
                     session.commit()
                     logger.info(f"Updated contact {contact_id} stage to {classification.new_pipeline_stage}")
@@ -397,25 +424,24 @@ def build_graph(session: Session):
 
     def node_draft(state: AgentState) -> Command:
         classification = state.get("classification")
-        stage = classification.new_pipeline_stage if classification else "discovery"
+        stage_key = classification.new_pipeline_stage if classification else "discovery"
         
+        # Fetch instructions from DB for the chosen stage
+        stage_record = session.exec(
+            select(PipelineStage).where(PipelineStage.key == stage_key)
+        ).first()
+        stage_instruction = stage_record.ai_instructions if stage_record else ""
+
         # Stage-driven prompt logic
         persona_segment = classification.intent_type if classification else "unknown"
         if persona_segment not in PERSONA_POLICIES:
             persona_segment = "unknown"
         persona_policy = PERSONA_POLICIES[persona_segment]
 
-        # Customize instruction based on stage
-        stage_instruction = ""
-        if stage == "discovery":
-            stage_instruction = "Ask for missing budget/timeline/scope. DO NOT send the Calendly link yet."
-        elif stage == "qualified":
-            stage_instruction = "The lead is qualified. Propose a consultation and provide the Calendly link."
-        elif stage == "proposal_ready":
-            stage_instruction = "Confirm details and mention an email proposal is being prepared. Ask for their best email."
-
         prompt = REPLY_PROMPT.format(
             channel=state.get("channel", "website"),
+            contact_name=state.get("contact_name", "there"),
+            agent_name=state.get("agent_name", "the Partnership Team"),
             relationship_type="inbound_lead", # Default
             engagement_temperature="warm",
             decision_role="decision_maker",
@@ -454,7 +480,9 @@ def build_graph(session: Session):
     
     g.set_entry_point("classify")
     
-    return g.compile(checkpointer=get_checkpointer())
+    return g.compile(
+        checkpointer=get_checkpointer(),
+    )
 
 
 def run_ai_pipeline(
@@ -499,6 +527,8 @@ def run_ai_pipeline(
         "estimator_context": estimator_context,
         "contact_id": contact.id,
         "conversation_id": conversation.id,
+        "contact_name": contact.username or "there",
+        "agent_name": settings.AGENT_NAME,
     }
     config = {"configurable": {"thread_id": str(conversation.id)}}
     
@@ -545,8 +575,8 @@ def run_ai_pipeline(
             next_action = "send_proposal"
             
     if not validate_action(contact, next_action):
-        next_action = "ask_missing_info"
         logger.warning(f"Governance restricted AI from taking action: {next_action}")
+        next_action = "ask_missing_info"
 
     if next_action == "book_consultation":
         record_outcome(session, contact.id, "booking_intent")

@@ -1,8 +1,12 @@
 import smtplib
+import ssl
+import logging
 from email.message import EmailMessage
 from typing import Any, Dict
 import httpx
 from pydantic import EmailStr
+
+logger = logging.getLogger(__name__)
 
 async def send_email(config: Dict[str, Any], recipient: str, subject: str, body: str):
     email_type = config.get("type")
@@ -27,12 +31,11 @@ async def send_smtp_email(config: Dict[str, Any], recipient: str, subject: str, 
     password = config["password"]
     use_tls = config.get("use_tls", True)
 
+    logger.info(f"Attempting to send SMTP email to {recipient} via {host}:{port} using TLS={use_tls}")
+
     try:
         if use_tls:
-            context = smtplib.SSLContext(smtplib.PROTOCOL_TLS_CLIENT)
-            context.check_hostname = False
-            context.verify_mode = smtplib.CERT_NONE
-            
+            context = ssl.create_default_context()
             with smtplib.SMTP(host, port) as server:
                 server.starttls(context=context)
                 server.login(user, password)
@@ -41,8 +44,10 @@ async def send_smtp_email(config: Dict[str, Any], recipient: str, subject: str, 
             with smtplib.SMTP(host, port) as server:
                 server.login(user, password)
                 server.send_message(msg)
+        logger.info(f"Successfully sent SMTP email to {recipient}")
         return {"ok": True}
     except Exception as e:
+        logger.error(f"Failed to send SMTP email to {recipient}: {e}")
         return {"ok": False, "error": str(e)}
 
 async def send_resend_email(config: Dict[str, Any], recipient: str, subject: str, body: str):

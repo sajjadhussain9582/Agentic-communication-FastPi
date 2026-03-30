@@ -10,6 +10,8 @@ from app.api.deps.auth import get_current_user
 from app.db.session import get_session
 from app.models.contact import Contact
 from app.models.conversation import Conversation
+from app.models.message import Message
+from app.models.pipeline_stage import PipelineStage
 from app.models.user import User
 
 router = APIRouter(prefix="/contacts", tags=["Contacts"])
@@ -125,6 +127,41 @@ def list_contacts(
     return out
 
 
+@router.get("/kanban")
+def get_kanban_leads(
+    _: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    # Fetch all active stages from DB
+    stages = list(session.exec(select(PipelineStage).order_by(PipelineStage.order_index)).all())
+    contacts = session.exec(select(Contact).order_by(desc(Contact.updated_at))).all()
+
+    # Dynamic grouping
+    kanban_data = {s.key: [] for s in stages}
+
+    for c in contacts:
+        item = {
+            "uuid": c.public_uuid,
+            "email": c.email,
+            "username": c.username,
+            "company": c.company,
+            "stage": c.pipeline_stage,
+            "status": c.status,
+            "lead_score": float(c.lead_score) if c.lead_score else 0,
+            "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+        }
+
+        stage_key = c.pipeline_stage or "discovery"
+        if stage_key in kanban_data:
+            kanban_data[stage_key].append(item)
+        else:
+            # Fallback if lead has an invalid stage string
+            if "discovery" in kanban_data:
+                kanban_data["discovery"].append(item)
+
+    return kanban_data
+
+
 def _contact_detail(session: Session, c: Contact) -> ContactDetailRead:
     convs = list(
         session.exec(select(Conversation).where(Conversation.contact_id == c.id)).all()
@@ -183,7 +220,15 @@ def patch_contact(
     if not c:
         raise HTTPException(404, "Contact not found")
     if body.stage is not None:
+        # If human changes stage, update both the string and the ID link
         c.stage = body.stage[:200]
+        c.pipeline_stage = body.stage
+        stage_record = session.exec(
+            select(PipelineStage).where(PipelineStage.key == body.stage)
+        ).first()
+        if stage_record:
+            c.pipeline_stage_id = stage_record.id
+        c.stage_entered_at = datetime.utcnow()
     if body.tags is not None:
         c.tags = body.tags
     if body.notes is not None:

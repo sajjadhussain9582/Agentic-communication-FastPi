@@ -39,6 +39,7 @@ class Contact(SQLModel, table=True):
     notes: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
     stage: str = Field(default="new", sa_column=Column(String(64), nullable=True))
     pipeline_stage: str = Field(default="lead", sa_column=Column(String(64), index=True))
+    pipeline_stage_id: Optional[int] = Field(default=None, foreign_key="pipeline_stages.id")
     stage_entered_at: datetime = Field(default_factory=datetime.utcnow)
     last_outbound_at: Optional[datetime] = None
     qualification_evidence: dict[str, Any] = Field(

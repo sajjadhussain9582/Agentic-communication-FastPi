@@ -5,6 +5,7 @@ from sqlmodel import Session, select
 from app.core.config import settings
 from app.models.form import Form
 from app.models.knowledge_base import KnowledgeBaseEntry
+from app.models.pipeline_stage import PipelineStage
 from app.services.kb_rag import ensure_entry_embedding
 
 
@@ -39,6 +40,51 @@ SAMPLE_FAQ = [
 
 
 def seed_if_empty(session: Session) -> None:
+    # 1. Pipeline Stages
+    if not session.exec(select(PipelineStage)).first():
+        stages = [
+            PipelineStage(
+                key="discovery",
+                pipelinestage="Discovery",
+                order_index=1,
+                ai_instructions="New leads. Ask for missing budget, timeline, or scope. Do not send booking links yet.",
+            ),
+            PipelineStage(
+                key="qualified",
+                pipelinestage="Qualified",
+                order_index=2,
+                ai_instructions="Serious leads with confirmed needs. Offer a consultation and provide the booking link.",
+            ),
+            PipelineStage(
+                key="proposal_ready",
+                pipelinestage="Proposal Ready",
+                order_index=3,
+                ai_instructions="All details gathered. Inform the lead that a formal proposal is being prepared.",
+            ),
+            PipelineStage(
+                key="negotiation",
+                pipelinestage="Negotiation",
+                order_index=4,
+                ai_instructions="Proposal sent. Address pricing, terms, or specific project adjustments.",
+            ),
+            PipelineStage(
+                key="won",
+                pipelinestage="Won",
+                order_index=5,
+                ai_instructions="Project accepted. Coordinate next steps for kickoff.",
+            ),
+            PipelineStage(
+                key="lost",
+                pipelinestage="Lost / Not Qualified",
+                order_index=6,
+                ai_instructions="Not a good fit or lead went cold. Archive and do not pursue further.",
+            ),
+        ]
+        for s in stages:
+            session.add(s)
+        session.commit()
+
+    # 2. Default Form
     if not session.exec(select(Form)).first():
         f = Form(
             title="Contact / lead intake",

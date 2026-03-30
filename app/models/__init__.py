@@ -10,3 +10,4 @@ from app.models.campaign import Campaign, CampaignTarget, CampaignMessageRow  # 
 from app.models.template import MessageTemplate  # noqa: F401
 from app.models.integration import Integration, IntegrationRun, WebhookEvent  # noqa: F401
 from app.models.outcome import Outcome  # noqa: F401
+from app.models.pipeline_stage import PipelineStage  # noqa: F401

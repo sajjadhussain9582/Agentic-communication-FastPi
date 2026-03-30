@@ -85,13 +85,13 @@ def get_form(
 
 
 @router.post("/{form_id}/submit")
-def submit_form(
+async def submit_form(
     form_id: int,
     body: dict[str, Any],
     session: Session = Depends(get_session),
     _auth: None = Depends(_optional_submit_auth),
 ):
-    result = process_form_submission(session, form_id, body)
+    result = await process_form_submission(session, form_id, body)
     if result.get("error") == "form_not_found":
         raise HTTPException(404, "Form not found")
     return result

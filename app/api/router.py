@@ -12,6 +12,7 @@ from app.api.routes.integrations import router as integrations_router
 from app.api.routes.webhooks_ghl import router as webhooks_ghl_router
 from app.api.routes.webhooks_calendly import router as webhooks_calendly_router
 from app.api.routes.ops import router as ops_router
+from app.api.routes.pipeline_stages import router as pipeline_stages_router
 
 api_router = APIRouter()
 api_router.include_router(health_router)
@@ -27,3 +28,4 @@ api_router.include_router(integrations_router)
 api_router.include_router(webhooks_ghl_router)
 api_router.include_router(webhooks_calendly_router)
 api_router.include_router(ops_router)
+api_router.include_router(pipeline_stages_router)

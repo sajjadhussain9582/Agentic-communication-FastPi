@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     DATABASE_URL: str
     SECRET_KEY: str = "supersecretkey"
-    SESSION_MAX_AGE: int = 3600
+    SESSION_MAX_AGE: int = 86400
     REDIS_HOST: str = "localhost"
     SUPABASE_URL: str
     SUPABASE_SERVICE_ROLE_KEY: str

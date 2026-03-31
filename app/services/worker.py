@@ -29,20 +29,24 @@ def sync_contacts_to_hubspot():
         if not integration:
             return
 
-        # Fetch all contacts. We use upsert so it's safe to sync everything
-        contacts = session.exec(select(Contact)).all()
+        # Fetch only contacts with status 'qualified'
+        contacts = session.exec(
+            select(Contact).where(Contact.status == "qualified")
+        ).all()
         if not contacts:
             return
 
-        logger.info(f"Worker: Checking {len(contacts)} contacts for HubSpot sync.")
+        logger.info(f"Worker: Found {len(contacts)} qualified contacts for HubSpot sync.")
         _perform_hubspot_sync(session, contacts)
 
 def sync_single_contact_to_hubspot_task(contact_id: int):
-    """Background task to sync a single contact immediately."""
+    """Background task to sync a single contact immediately if qualified."""
     with Session(engine) as session:
         contact = session.get(Contact, contact_id)
-        if contact:
+        if contact and contact.status == "qualified":
             _perform_hubspot_sync(session, [contact])
+        else:
+            logger.info(f"Worker: Skipping HubSpot sync for contact {contact_id} (status: {contact.status if contact else 'None'})")
 
 def _perform_hubspot_sync(session: Session, contacts: list[Contact]):
     hubspot = HubSpotClient(session)

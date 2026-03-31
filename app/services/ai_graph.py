@@ -159,13 +159,17 @@ PERSONA_POLICIES: dict[str, dict[str, str]] = {
 
     "unknown": {
         "focus": "identify role, intent, and seriousness quickly without making assumptions",
-        "value": "we provide end-to-end project services tailored to client or partner needs",
-        "questions": "what are you looking to build, your role in the project, budget, timeline, and decision authority",
-        "cta": "If enough clarity, guide to consultation; otherwise continue structured qualification",
+        "value": "we support real-estate and construction stakeholders with architecture, planning, and execution",
+        "questions": "what type of property/construction project you need support with, your role, budget, timeline, and decision authority",
+        "cta": "If in-scope and clear, guide to consultation; otherwise request clarification politely",
     },
 }
 
-DECISION_PROMPT = """You are an AI Sales Manager for a B2B services company.
+DECISION_PROMPT = """You are an AI Sales Manager for a B2B services company of real estate (• Contractors
+• Real estate agents
+• Real estate developersz
+• architects
+• home builders)
 
 Your responsibility is to:
 - qualify leads accurately
@@ -310,6 +314,20 @@ GENERAL RULES
 - Do not include any keys outside the schema
 
 --------------------------------
+OUT-OF-DOMAIN GUARDRAIL (SOFTWARE/WEB)
+--------------------------------
+
+- This system serves ONLY the real estate / construction ecosystem:
+  contractors, real-estate agents, real-estate developers, architects, home builders.
+- If the message is clearly about websites, web apps, SaaS platforms, or generic IT/software development,
+  then treat it as OUT OF SCOPE:
+  - Set role_type = "unknown".
+  - Set is_qualified = false.
+  - Prefer qualification_stage = "not_qualified".
+  - Prefer new_pipeline_stage = "lost" or stay at "discovery".
+  - In requires_action, DO NOT include send_calendly or send_proposal.
+
+--------------------------------
 
 Form/channel context:
 {json_snapshot}
@@ -341,6 +359,17 @@ CORE RULES
 - Do NOT repeat questions already answered
 - Do NOT ask more than 1–2 questions
 - Do NOT overwhelm the user
+
+--------------------------------
+OUT-OF-SCOPE HANDLING (CRITICAL)
+--------------------------------
+
+- This assistant ONLY supports real-estate / construction domain.
+- If user asks for website, app, software, SaaS, IT development, or unrelated digital-product services:
+  - clearly state this is outside service scope
+  - do NOT ask website/app follow-up discovery questions
+  - do NOT claim capability to deliver such digital services
+  - offer help only for in-scope real-estate/construction services
 
 --------------------------------
 KNOWLEDGE & ACCURACY
@@ -526,7 +555,9 @@ def _extract_slot_state(user_text: str, contact: Contact) -> dict[str, Any]:
     if contact.timeline and "timeline_signal" not in slots:
         slots["timeline_signal"] = contact.timeline
 
-    if re.search(r"\b(ecommerce|e-commerce|shop|store|website|app|office|renew|construction)\b", text):
+    # Treat only real-estate / construction terms as valid project_type triggers.
+    # Explicitly exclude generic software/web dev terms from domain.
+    if re.search(r"\b(house|home|apartment|flat|villa|plot|residential|commercial|building|construction|renovation|remodel)\b", text):
         slots["project_type"] = user_text[:120]
     if re.search(r"\b(\$|usd|budget|k\b|million|m\b)\b", text):
         slots["budget_signal"] = user_text[:120]
@@ -659,8 +690,8 @@ def build_graph(session: Session):
         ).first()
         stage_instruction = stage_record.ai_instructions if stage_record else ""
 
-        # Stage-driven prompt logic
-        persona_segment = classification.intent_type if classification else "unknown"
+        # Stage-driven prompt logic (use role_type, not intent_type)
+        persona_segment = classification.role_type if classification else "unknown"
         if persona_segment not in PERSONA_POLICIES:
             persona_segment = "unknown"
         persona_policy = PERSONA_POLICIES[persona_segment]
@@ -668,7 +699,7 @@ def build_graph(session: Session):
         prompt = REPLY_PROMPT.format(
             channel=state.get("channel", "website"),
             contact_name=state.get("contact_name", "there"),
-            agent_name=state.get("agent_name", "the Partnership Team"),
+            agent_name=state.get("agent_name", "StrategistHub"),
             stage_key=stage_key,
             relationship_type="inbound_lead", # Default
             engagement_temperature="warm",

@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     PUBLIC_APP_URL: str = ""  # Used in integration OAuth stub URLs
     FRONTEND_URL: str = "http://localhost:3000"
     GHL_WEBHOOK_SECRET: str = ""  # Optional: require X-GHL-Secret or Authorization
-    AGENT_NAME: str = "Partnership Team"
+    AGENT_NAME: str = "StrategistHub"
 
     # HubSpot OAuth
     HUBSPOT_CLIENT_ID: str = ""

@@ -40,6 +40,13 @@ def sync_pipeline_stage(session: Session, contact: Contact, ai_decision: Dict[st
     if contact.budget: all_slots.add("budget_signal")
     if contact.timeline: all_slots.add("timeline_signal")
     
+    # Also check external_ids/slots
+    ext = contact.external_ids or {}
+    slots = ext.get("slots", {})
+    for k, v in slots.items():
+        if v:
+            all_slots.add(k)
+    
     # 2. Determine target stage based on meeting ALL requirements
     target_stage = "lead"
     for stage_name in PIPELINE_ORDER:
@@ -64,6 +71,10 @@ def sync_pipeline_stage(session: Session, contact: Contact, ai_decision: Dict[st
             
             # Sync with legacy 'stage' field to prevent UI breakage
             contact.stage = target_stage
+            
+            # Sync status field for worker sync
+            if target_stage == "qualified":
+                contact.status = "qualified"
             
             # Update evidence log
             evidence = contact.qualification_evidence or {}

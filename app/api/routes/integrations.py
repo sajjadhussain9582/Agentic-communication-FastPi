@@ -194,7 +194,6 @@ def configure_calendly(
 
 @router.get("/calendly/event-types")
 async def get_calendly_event_types(
-    _: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
     row = session.exec(select(Integration).where(Integration.provider == "scheduling")).first()

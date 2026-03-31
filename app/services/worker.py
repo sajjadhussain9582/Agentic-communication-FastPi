@@ -3,7 +3,7 @@ import asyncio
 from email.utils import parseaddr
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
-from sqlmodel import Session, select
+from sqlmodel import Session, select, or_
 from app.core.database import engine
 from app.models.campaign import CampaignMessageRow, CampaignTarget
 from app.models.contact import Contact
@@ -29,9 +29,15 @@ def sync_contacts_to_hubspot():
         if not integration:
             return
 
-        # Fetch only contacts with status 'qualified'
+        # Fetch contacts with status or pipeline_stage 'qualified'
         contacts = session.exec(
-            select(Contact).where(Contact.status == "qualified")
+            select(Contact).where(
+                or_(
+                    Contact.status == "qualified",
+                    Contact.pipeline_stage == "qualified",
+                    Contact.stage == "qualified"
+                )
+            )
         ).all()
         if not contacts:
             return
@@ -132,12 +138,15 @@ def check_incoming_emails():
             return
 
         logger.info(f"Worker: Found {len(new_messages)} new emails to process.")
-        for msg in new_messages:
-            try:
-                sender_details = {"email": msg["from"], "name": msg["from"]}
-                asyncio.run(process_inbound_message(session, "email", sender_details, msg["body"], msg["subject"]))
-            except Exception as e:
-                logger.error(f"Worker: Error processing incoming email: {e}")
+        # Process all new messages concurrently
+        async def process_all():
+            tasks = [
+                process_inbound_message(session, "email", {"email": msg["from"], "name": msg["from"]}, msg["body"], msg["subject"])
+                for msg in new_messages
+            ]
+            await asyncio.gather(*tasks)
+
+        asyncio.run(process_all())
 
 def check_queued_messages():
     """Find and send queued campaign messages."""

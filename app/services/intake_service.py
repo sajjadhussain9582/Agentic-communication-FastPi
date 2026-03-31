@@ -77,7 +77,7 @@ async def process_inbound_message(session: Session, channel: str, sender_details
     session.refresh(inbound)
 
     try:
-        outbound = run_ai_pipeline(session, conv, contact, inbound, {})
+        outbound = await run_ai_pipeline(session, conv, contact, inbound, {})
         if outbound:
             # Fix: call with keyword arguments as deliver_message expects them
             await deliver_message(

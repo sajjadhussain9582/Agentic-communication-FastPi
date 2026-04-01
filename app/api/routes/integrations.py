@@ -288,7 +288,7 @@ async def hubspot_callback(
         await client.exchange_code_for_tokens(code)
         # Redirect back to the frontend integration page
         frontend_url = settings.FRONTEND_URL or "http://localhost:3000"
-        return RedirectResponse(f"{frontend_url}/settings/integrations?status=success&provider=hubspot")
+        return RedirectResponse(f"{frontend_url}/dashboard/integrations?status=success&provider=hubspot")
     except Exception as e:
         logger.error(f"HubSpot OAuth error: {str(e)}")
         frontend_url = settings.FRONTEND_URL or "http://localhost:3000"

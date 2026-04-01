@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -15,6 +16,9 @@ from app.core.config import settings
 from app.models.knowledge_base import KnowledgeBaseEntry
 
 logger = logging.getLogger(__name__)
+
+def _rag_debug_enabled() -> bool:
+    return os.getenv("RAG_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclass
@@ -27,6 +31,38 @@ class RetrievedChunk:
     intent_type: str | None = None
     role_type: str | None = None
     priority: int = 0
+
+
+def normalize_query(query: str) -> str:
+    """Preprocess query to standardize currencies and locations."""
+    import re
+    # Normalize currencies: e.g., "40k AUD" -> "40000 USD"
+    def replace_currency(match):
+        num_str = match.group(1)
+        k = match.group(2)
+        curr = match.group(3)
+        num = int(num_str)
+        if k:
+            num *= 1000
+        return f"{num} USD"
+    
+    query = re.sub(r'(\d+)(k?)\s*([A-Z]{3})', replace_currency, query, flags=re.IGNORECASE)
+    
+    # Normalize locations: e.g., "lahore" -> "Lahore, Pakistan"
+    location_map = {
+        "lahore": "Lahore, Pakistan",
+        # Add more known locations as needed
+    }
+    words = query.split()
+    normalized_words = []
+    for word in words:
+        lower = word.lower()
+        if lower in location_map:
+            normalized_words.append(location_map[lower])
+        else:
+            normalized_words.append(word.title())  # Capitalize other words
+    query = ' '.join(normalized_words)
+    return query
 
 
 # ── Embedding helpers ───────────────────────────────────────────────────────
@@ -103,6 +139,7 @@ def search_similar(
     category: str | None = None,
 ) -> tuple[list[RetrievedChunk], list[int]]:
     """Search KB via Postgres match_knowledge_base(), with Python fallback."""
+    query = normalize_query(query)
     try:
         qvec = embed_single(query)
     except Exception:
@@ -112,6 +149,8 @@ def search_similar(
     # ── Try pgvector path first ─────────────────────────────────────────
     try:
         vec_str = "[" + ",".join(str(v) for v in qvec) + "]"
+        if _rag_debug_enabled():
+            logger.info("KB retrieval debug: query='%s' category='%s' min_score=%.2f", query[:100], category, min_score)
         result = session.execute(
             text(
                 "SELECT * FROM match_knowledge_base(:qe, :mc, :fc)"
@@ -145,6 +184,13 @@ def search_similar(
                 "KB retrieval (pgvector): query='%s' category=%s top_score=%.3f top_id=%s",
                 query[:60], category, chunks[0].score, chunks[0].id,
             )
+            if _rag_debug_enabled():
+                logger.info(
+                    "KB retrieval (pgvector debug): ids=%s scores=%s",
+                    [c.id for c in chunks],
+                    [round(c.score, 3) for c in chunks],
+                )
+                logger.info(f"RAG debug: matched_kb_questions={[c.question for c in chunks]}")
             return chunks, [c.id for c in chunks]
 
         logger.info("KB retrieval (pgvector): no results above threshold %.2f", min_score)
@@ -191,6 +237,13 @@ def search_similar(
             "KB retrieval (fallback): query='%s' top_score=%.3f top_id=%s",
             query[:60], chunks[0].score, chunks[0].id,
         )
+        if _rag_debug_enabled():
+            logger.info(
+                "KB retrieval (fallback debug): ids=%s scores=%s",
+                [c.id for c in chunks],
+                [round(c.score, 3) for c in chunks],
+            )
+            logger.info(f"RAG debug: matched_kb_questions={[c.question for c in chunks]}")
 
     return chunks, [c.id for c in chunks]
 

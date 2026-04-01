@@ -3,11 +3,12 @@ import asyncio
 from email.utils import parseaddr
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
-from sqlmodel import Session, select, or_
+from sqlmodel import Session, select, or_, exists
 from app.core.database import engine
 from app.models.campaign import CampaignMessageRow, CampaignTarget
 from app.models.contact import Contact
 from app.models.conversation import Conversation
+from app.models.message import Message
 from app.models.integration import Integration
 from app.services.channel_delivery import deliver_message
 from app.services.pipeline_manager import detect_sla_violation
@@ -254,6 +255,60 @@ def check_stale_leads():
         
         session.commit()
 
+def check_qualified_leads():
+    """Check qualified leads with no recent activity and send follow-up."""
+    with Session(engine) as session:
+        # Find qualified conversations with no messages in last 7 days
+        cutoff = datetime.utcnow() - timedelta(days=7)
+        qualified_convs = session.exec(
+            select(Conversation)
+            .where(Conversation.status == "open")
+            .where(or_(
+                Conversation.stage == "qualified",
+                Conversation.pipeline_stage == "qualified"
+            ))
+            .where(~exists(
+                select(Message)
+                .where(Message.conversation_id == Conversation.id)
+                .where(Message.created_at > cutoff)
+            ))
+        ).all()
+        
+        logger.info(f"Worker: Found {len(qualified_convs)} qualified leads needing follow-up.")
+        
+        for conv in qualified_convs:
+            contact = session.get(Contact, conv.contact_id)
+            if not contact or not contact.email:
+                continue
+            
+            # Generate follow-up message
+            followup_msg = Message(
+                conversation_id=conv.id,
+                conversation_public_uuid=conv.public_uuid,
+                sender_type="agent",
+                message_type="text",
+                message="Hi, just checking in on your project. Do you have any updates or questions?",
+                channel="email",
+                is_generated=True,
+                is_handled=True,
+            )
+            session.add(followup_msg)
+            session.commit()
+            session.refresh(followup_msg)
+            
+            # Send via email
+            try:
+                asyncio.run(deliver_message(
+                    session,
+                    channel="email",
+                    recipient=contact.email,
+                    message=followup_msg.message,
+                    metadata={"subject": "Follow-up on Your Project"}
+                ))
+                logger.info(f"Worker: Sent follow-up to qualified lead {contact.email}")
+            except Exception as e:
+                logger.error(f"Worker: Failed to send follow-up to {contact.email}: {e}")
+
 scheduler = BackgroundScheduler()
 
 def start_worker():
@@ -261,6 +316,7 @@ def start_worker():
     scheduler.add_job(check_incoming_emails, 'interval', seconds=60, id='check_incoming_emails')
     scheduler.add_job(check_queued_messages, 'interval', minutes=1, id='check_queued_messages')
     scheduler.add_job(check_stale_leads, 'interval', minutes=3, id='check_stale_leads')
+    scheduler.add_job(check_qualified_leads, 'interval', hours=24, id='check_qualified_leads')
     scheduler.add_job(sync_contacts_to_hubspot, 'interval', minutes=5, id='sync_contacts_to_hubspot')
     scheduler.start()
     logger.info("Background worker initialized and started.")

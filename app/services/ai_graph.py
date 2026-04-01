@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from decimal import Decimal
 from typing import Any, TypedDict
@@ -33,6 +34,9 @@ from app.services.workflow_engine import run_decision_workflows
 from app.api.routes.integrations import get_calendly_event_types
 
 logger = logging.getLogger(__name__)
+
+def _rag_debug_enabled() -> bool:
+    return os.getenv("RAG_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
 
 # Global checkpointer for human-in-the-loop interrupts
 _memory_saver = MemorySaver()
@@ -646,6 +650,29 @@ def build_graph(session: Session):
         chunks, kb_ids = search_similar(
             session, q, top_k=5, min_score=0.35, category=routed_category,
         )
+        if _rag_debug_enabled():
+            logger.info(
+                "RAG debug: conversation_id=%s contact_id=%s category=%s kb_ids=%s",
+                state.get("conversation_id"),
+                state.get("contact_id"),
+                routed_category,
+                kb_ids,
+            )
+            if chunks:
+                logger.info(
+                    "RAG debug: top_matches=%s",
+                    [
+                        {
+                            "id": c.id,
+                            "score": round(float(c.score), 3),
+                            "category": c.category,
+                            "intent_type": c.intent_type,
+                            "role_type": c.role_type,
+                            "question": (c.question or "")[:120],
+                        }
+                        for c in chunks[:5]
+                    ],
+                )
         rag_ctx = format_rag_context(chunks)
         return Command(
             update={"rag_context": rag_ctx, "rag_kb_ids": kb_ids},
@@ -758,6 +785,15 @@ async def run_ai_pipeline(
         user_text = "(System nudge: Lead has been silent. Re-engage politely based on prior context.)"
     else:
         user_text = inbound_message.message
+
+    # Check for keywords to assume defaults and provide plan
+    keywords = ["immediately", "proceed", "yes"]
+    if any(kw in user_text.lower() for kw in keywords):
+        user_text += " Assume defaults: project type is double-storey, timeline is ASAP. Provide a detailed plan instead of asking more questions. Use new KB entries for guidance."
+        # Clear recent context to avoid looping
+        recent_context = ""
+    else:
+        recent_context = _build_recent_context(session, conversation.id, limit=5)
 
     # Fetch booking links if Calendly is configured
     booking_links = []

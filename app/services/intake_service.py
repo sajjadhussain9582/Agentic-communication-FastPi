@@ -9,8 +9,15 @@ from app.services.ai_graph import run_ai_pipeline
 from app.services.channel_delivery import deliver_message
 from datetime import datetime
 import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 async def process_inbound_message(session: Session, channel: str, sender_details: dict[str, Any], message_body: str, subject: str = None):
+    logger.info(f"Processing inbound {channel} message from {sender_details} subject: {subject}")
+    email = sender_details.get("email")
+    phone = sender_details.get("phone")
+    name = sender_details.get("name")
     email = sender_details.get("email")
     phone = sender_details.get("phone")
     name = sender_details.get("name")
@@ -77,8 +84,10 @@ async def process_inbound_message(session: Session, channel: str, sender_details
     session.refresh(inbound)
 
     try:
+        logger.info(f"Running AI pipeline for conversation {conv.id}, contact {contact.id}")
         outbound = await run_ai_pipeline(session, conv, contact, inbound, {})
         if outbound:
+            logger.info(f"Generated outbound message: {outbound.message[:100]}...")
             # Fix: call with keyword arguments as deliver_message expects them
             await deliver_message(
                 session,
@@ -88,4 +97,4 @@ async def process_inbound_message(session: Session, channel: str, sender_details
                 metadata={"subject": f"Re: {subject}" if subject else "Re: Project Inquiry"}
             )
     except Exception as e:
-        print(f"Error running AI pipeline: {e}")
+        logger.error(f"Error running AI pipeline: {e}")

@@ -31,7 +31,6 @@ from app.services.metrics import record_outcome
 from app.services.pipeline_manager import sync_pipeline_stage
 from app.services.policy_engine import validate_action
 from app.services.workflow_engine import run_decision_workflows
-from app.api.routes.integrations import get_calendly_event_types
 
 logger = logging.getLogger(__name__)
 
@@ -797,15 +796,19 @@ async def run_ai_pipeline(
 
     # Fetch booking links if Calendly is configured
     booking_links = []
+    booking_url = ""
     try:
-        events = await get_calendly_event_types(session)
-        for event in events.get("collection", []):
-            booking_links.append({
-                "name": event.get("name"),
-                "url": event.get("scheduling_url"),
-            })
+        from app.services.integrations.calendly_client import CalendlyClient
+        calendly = CalendlyClient(session)
+        dynamic_url = await calendly.get_booking_url("30min")
+        if dynamic_url:
+            booking_url = dynamic_url
+            booking_links.append({"name": "30min Consultation", "url": dynamic_url})
+        else:
+            booking_url = "https://calendly.com/sajjad_hussain-strategisthub/30min"  # Fallback
     except Exception as e:
-        logger.warning(f"Could not fetch Calendly event types: {e}")
+        logger.warning(f"Could not fetch Calendly booking URL: {e}")
+        booking_url = "https://calendly.com/sajjad_hussain-strategisthub/30min"  # Fallback
 
     json_response = json_response or {}
     channel = conversation.channel
@@ -832,7 +835,7 @@ async def run_ai_pipeline(
         "is_proactive": is_proactive,
         "channel": channel,
         "json_snapshot": json.dumps(json_response, default=str)[:12000],
-        "booking_url": settings.CALENDLY_BOOKING_URL or "",
+        "booking_url": booking_url,
         "booking_links": booking_links,
         "conversation_turn": max(1, conversation_turn),
         "recent_context": recent_context,

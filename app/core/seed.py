@@ -56,27 +56,33 @@ def seed_if_empty(session: Session) -> None:
                 ai_instructions="Serious leads with confirmed needs. Offer a consultation and provide the booking link.",
             ),
             PipelineStage(
+                key="meeting_booked",
+                pipelinestage="Meeting Booked",
+                order_index=3,
+                ai_instructions="Lead has scheduled a meeting. Prepare for the consultation and follow up if needed.",
+            ),
+            PipelineStage(
                 key="proposal_ready",
                 pipelinestage="Proposal Ready",
-                order_index=3,
+                order_index=4,
                 ai_instructions="All details gathered. Inform the lead that a formal proposal is being prepared.",
             ),
             PipelineStage(
                 key="negotiation",
                 pipelinestage="Negotiation",
-                order_index=4,
+                order_index=5,
                 ai_instructions="Proposal sent. Address pricing, terms, or specific project adjustments.",
             ),
             PipelineStage(
                 key="won",
                 pipelinestage="Won",
-                order_index=5,
+                order_index=6,
                 ai_instructions="Project accepted. Coordinate next steps for kickoff.",
             ),
             PipelineStage(
                 key="lost",
                 pipelinestage="Lost / Not Qualified",
-                order_index=6,
+                order_index=7,
                 ai_instructions="Not a good fit or lead went cold. Archive and do not pursue further.",
             ),
         ]

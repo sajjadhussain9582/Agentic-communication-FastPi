@@ -15,6 +15,7 @@ from app.services.pipeline_manager import detect_sla_violation
 from app.services.nurture import run_nurture_audit
 from app.services.imap_service import fetch_new_emails
 from app.services.intake_service import process_inbound_message
+from app.services.integrations.calendly_client import CalendlyClient
 from app.services.integrations.hubspot_client import HubSpotClient
 
 logger = logging.getLogger(__name__)
@@ -309,6 +310,83 @@ def check_qualified_leads():
             except Exception as e:
                 logger.error(f"Worker: Failed to send follow-up to {contact.email}: {e}")
 
+def check_calendly_bookings():
+    """Check for new Calendly bookings and update lead status."""
+    with Session(engine) as session:
+        integration = session.exec(
+            select(Integration).where(Integration.provider == "scheduling", Integration.status == "connected")
+        ).first()
+        
+        if not integration:
+            return
+
+        # Get last checked time from config
+        last_checked = None
+        if integration.config_json and "last_calendly_check" in integration.config_json:
+            last_checked_str = integration.config_json["last_calendly_check"]
+            last_checked = datetime.fromisoformat(last_checked_str)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            client = CalendlyClient(session)
+            new_bookings = loop.run_until_complete(client.check_new_bookings(session, last_checked))
+            if new_bookings:
+                logger.info(f"Worker: Found {len(new_bookings)} matched Calendly bookings to process.")
+                for booking in new_bookings:
+                    contact = booking["contact"]
+                    metadata = booking["metadata"]
+                    
+                    # Update contact pipeline stage
+                    old_stage = contact.pipeline_stage
+                    contact.pipeline_stage = "meeting_booked"
+                    contact.stage_entered_at = datetime.utcnow()
+                    
+                    # Store metadata in external_ids
+                    if not contact.external_ids:
+                        contact.external_ids = {}
+                    if "calendly" not in contact.external_ids:
+                        contact.external_ids["calendly"] = []
+                    contact.external_ids["calendly"].append(metadata)
+                    
+                    session.add(contact)
+                    
+                    # Find conversation and add a message
+                    conv = session.exec(
+                        select(Conversation).where(Conversation.contact_id == contact.id)
+                    ).first()
+                    if conv:
+                        booking_msg = Message(
+                            conversation_id=conv.id,
+                            conversation_public_uuid=conv.public_uuid,
+                            sender_type="system",
+                            message_type="text",
+                            message=f"Meeting booked via Calendly: {metadata['scheduled_start_time']}",
+                            channel="system",
+                            is_generated=True,
+                            is_handled=True,
+                        )
+                        session.add(booking_msg)
+                    
+                    logger.info(f"Worker: Updated contact {contact.email} stage from {old_stage} to {contact.pipeline_stage}")
+            else:
+                logger.debug("Worker: No new Calendly bookings found in this cycle.")
+            
+            # Update last checked time
+            now = datetime.utcnow()
+            if not integration.config_json:
+                integration.config_json = {}
+            integration.config_json["last_calendly_check"] = now.isoformat()
+            integration.last_sync_at = now
+            session.add(integration)
+            session.commit()
+            
+        except Exception as e:
+            logger.error(f"Worker: Error checking Calendly bookings: {e}")
+        finally:
+            loop.close()
+
 scheduler = BackgroundScheduler()
 
 def start_worker():
@@ -318,5 +396,6 @@ def start_worker():
     scheduler.add_job(check_stale_leads, 'interval', minutes=3, id='check_stale_leads')
     scheduler.add_job(check_qualified_leads, 'interval', hours=24, id='check_qualified_leads')
     scheduler.add_job(sync_contacts_to_hubspot, 'interval', minutes=5, id='sync_contacts_to_hubspot')
+    scheduler.add_job(check_calendly_bookings, 'interval', seconds=30, id='check_calendly_bookings')
     scheduler.start()
     logger.info("Background worker initialized and started.")

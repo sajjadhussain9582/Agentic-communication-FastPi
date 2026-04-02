@@ -114,7 +114,7 @@ async def webhook_ghl_message(
         session.refresh(inbound)
         if settings.OPENAI_API_KEY:
             try:
-                run_ai_pipeline(session, conv, contact, inbound, body)
+                await run_ai_pipeline(session, conv, contact, inbound, body)
             except Exception:
                 pass
     session.commit()

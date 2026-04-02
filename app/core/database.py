@@ -6,7 +6,7 @@ engine = create_engine(
     settings.DATABASE_URL,
     echo=False,  # Set True for SQL debugging
     pool_pre_ping=True,
-    connect_args={"prepare_threshold": None} if "psycopg" in settings.DATABASE_URL or True else {}
+    connect_args={"prepare_threshold": None} if "psycopg" in settings.DATABASE_URL else {}
 )
 
 # Silence pgvector warnings by acknowledging the 'vector' type on connect
@@ -26,7 +26,8 @@ def register_vector(dbapi_connection, connection_record):
 
 def init_db():
     import app.models  # noqa: F401 — register all SQLModel tables
-    # SQLModel.metadata.create_all(engine) # Handled by Alembic now
+    if "sqlite" in settings.DATABASE_URL:
+        SQLModel.metadata.create_all(engine)
     from app.core.phase2_migrate import (
         backfill_uuids,
         ensure_default_integrations,

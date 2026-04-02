@@ -31,8 +31,13 @@ async def process_form_submission(session: Session, form_id: int, body: dict[str
     }
 
     # This will now handle contact/conversation creation and trigger the AI pipeline
-    await process_inbound_message(session, channel, sender_details, user_text)
+    conv = await process_inbound_message(session, channel, sender_details, user_text)
 
-    # The rest of the function can be simplified as the core logic is now in intake_service
     # For now, we will just return a success message
-    return {"status": "success", "message": "Form submission processed."}
+    return {
+        "status": "success",
+        "message": "Form submission processed.",
+        "conversation_id": conv.id,
+        "conversation_uuid": conv.public_uuid,
+        "contact_id": conv.contact_id,
+    }

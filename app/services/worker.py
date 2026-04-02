@@ -244,7 +244,8 @@ def check_stale_leads():
             logger.info(f"Worker: Re-engagement triggered for stale lead {contact.email or contact.username}")
             try:
                 from app.services.ai_graph import run_ai_pipeline
-                run_ai_pipeline(session, conv, contact)
+                import asyncio
+                asyncio.run(run_ai_pipeline(session, conv, contact))
                 # Mark outbound time on contact
                 contact.last_outbound_at = datetime.utcnow()
                 session.add(contact)

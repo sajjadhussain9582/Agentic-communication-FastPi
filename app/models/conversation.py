@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Column, String
+from sqlalchemy import Column, String, Text
 from sqlmodel import Field, SQLModel
 
 
@@ -25,6 +25,7 @@ class Conversation(SQLModel, table=True):
     status: str = Field(default="open")
     is_assigned_to_agent: bool = Field(default=False)
     is_escalated: bool = Field(default=False)
+    escalation_brief: Optional[str] = Field(sa_column=Column(Text, nullable=True))
     qualification_stage: Optional[str] = None
     last_intent: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)

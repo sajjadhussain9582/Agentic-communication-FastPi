@@ -84,6 +84,7 @@ class ConversationDetailRead(BaseModel):
     channel: str
     status: str
     is_escalated: bool
+    escalation_brief: Optional[str] = None
     last_intent: Optional[str] = None
     qualification_stage: Optional[str] = None
     messages: list[MessageRead] = Field(default_factory=list)

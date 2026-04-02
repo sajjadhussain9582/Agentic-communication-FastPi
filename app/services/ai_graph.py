@@ -45,7 +45,7 @@ _pool = None
 
 def get_checkpointer():
     global _pool
-    if not settings.DATABASE_URL:
+    if not settings.DATABASE_URL or "sqlite" in settings.DATABASE_URL:
         return _memory_saver
     
     if _pool is None:
@@ -60,7 +60,7 @@ def get_checkpointer():
 
 def setup_checkpointer():
     """Initializes the checkpoints table if it doesn't exist."""
-    if not settings.DATABASE_URL:
+    if not settings.DATABASE_URL or "sqlite" in settings.DATABASE_URL:
         return
     
     global _pool
@@ -521,6 +521,80 @@ USER MESSAGE
 
 {user_text}
 """
+
+ESCALATION_BRIEF_PROMPT = """You are an AI Sales Analyst. Your goal is to summarize the entire conversation and extracted data into a clear, actionable brief that helps a human quickly understand the context of a lead escalation.
+
+Your output MUST follow this EXACT format and use the provided data. If any field is unknown, write "Not specified". Do NOT include placeholders.
+
+---
+
+Lead Summary:
+- Name: {contact_name}
+- Role / Persona: {role_type}
+- Relationship Type: {relationship_type}
+- Decision Role: {decision_role}
+- Engagement Level: {engagement_temperature}
+
+---
+
+Project / Requirement:
+- Project Type: {project_type}
+- Scope: {project_scope}
+- Budget: {budget}
+- Timeline: {timeline}
+- Location: {geography}
+
+---
+
+Qualification Status:
+- Current Stage: {stage_key}
+- Qualification Status: {qualification_stage}
+- Lead Score: {lead_score}
+- Close Readiness: {close_readiness_score}
+
+---
+
+Key Signals:
+- Buying Intent: {buying_intent_summary}
+- Urgency Level: {urgency_level}
+- Constraints or Risks: {constraints_risks}
+
+---
+
+Conversation Highlights:
+{conversation_highlights}
+
+---
+
+Missing Information:
+{missing_info_list}
+
+---
+
+Recommended Next Action:
+{recommended_action}
+
+---
+
+AI Notes (Internal):
+- {ai_internal_notes}
+
+-----------------------------
+DATA CONTEXT:
+Classification: {classification_json}
+Recent Context: {recent_context}
+User Message: {user_text}
+-----------------------------
+
+Instructions for fields:
+- Buying Intent: summarize briefly based on user language (1-2 lines)
+- Urgency Level: low / medium / high (based on timeline and language)
+- Constraints or Risks: mention missing info, unclear budget, or hesitation signals
+- Conversation Highlights: 3-5 bullet points focusing on decisions, preferences, and important statements. Avoid generic phrases.
+- Missing Information: Bulleted list of critical missing fields.
+- Recommended Next Action: Suggest ONE clear action (e.g., book consultation, send proposal, continue qualification, escalate to senior team).
+- AI Notes (Internal): Mention why escalation happened and any inconsistencies/risks.
+"""
 def _safe_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(v).strip() for v in value if str(v).strip()]
@@ -754,8 +828,81 @@ def build_graph(session: Session):
         return Command(update={"generated_reply": reply.strip()}, goto=END)
 
     def node_human_review(state: AgentState) -> Command:
+        classification = state.get("classification")
+        conversation_id = state.get("conversation_id")
+        
+        logger.info(f"Node human_review: conversation={conversation_id}, is_escalated={classification.is_escalated if classification else 'None'}")
+        
+        if classification and classification.is_escalated and conversation_id:
+            try:
+                conv = session.get(Conversation, conversation_id)
+                if conv:
+                    logger.info("Generating escalation brief...")
+                    cl_dict = classification.model_dump()
+                    
+                    # Fetch recent messages for context
+                    history_text = "\n".join([f"{m.type}: {m.content}" for m in state.get("messages", [])[-10:]])
+                    
+                    prompt = ESCALATION_BRIEF_PROMPT.format(
+                        contact_name=state.get("contact_name") or "Not specified",
+                        role_type=cl_dict.get("role_type") or "Not specified",
+                        relationship_type=cl_dict.get("relationship_type") or "Not specified",
+                        decision_role=cl_dict.get("decision_role") or "Not specified",
+                        engagement_temperature=cl_dict.get("engagement_temperature") or "Not specified",
+                        project_type=cl_dict.get("project_type") or "Not specified",
+                        project_scope=cl_dict.get("project_scope") or "Not specified",
+                        budget=cl_dict.get("budget") or "Not specified",
+                        timeline=cl_dict.get("timeline") or "Not specified",
+                        geography=cl_dict.get("geography") or "Not specified",
+                        stage_key=cl_dict.get("new_pipeline_stage") or "Not specified",
+                        qualification_stage=cl_dict.get("qualification_stage") or "Not specified",
+                        lead_score=cl_dict.get("lead_score") if cl_dict.get("lead_score") is not None else "Not specified",
+                        close_readiness_score=cl_dict.get("close_readiness_score") if cl_dict.get("close_readiness_score") is not None else "Not specified",
+                        buying_intent_summary="[Analyze from history]",
+                        urgency_level="[Analyze from history]",
+                        constraints_risks="[Analyze from history]",
+                        conversation_highlights="[Summarize salient points]",
+                        missing_info_list="[Identify gaps]",
+                        recommended_action="[What should human do next?]",
+                        ai_internal_notes="[Your internal reasoning]",
+                        classification_json=json.dumps(cl_dict),
+                        recent_context=state.get("recent_context") or "Not specified",
+                        user_text=state.get("user_text") or "Not specified",
+                        conversation_history=history_text
+                    )
+                    
+                    logger.info("Invoking LLM for brief...")
+                    summary_out = llm.invoke([
+                        SystemMessage(content="You are a professional sales analyst summarizing a lead escalation."),
+                        HumanMessage(content=prompt)
+                    ])
+                    brief_content = summary_out.content if hasattr(summary_out, "content") else str(summary_out)
+                    
+                    # Update conversation record
+                    conv.is_escalated = True
+                    conv.status = "pending_human"
+                    conv.escalation_brief = brief_content.strip()
+                    session.add(conv)
+                    
+                    # Also add as a system message for UI visibility
+                    system_msg = Message(
+                        conversation_id=conv.id,
+                        conversation_public_uuid=conv.public_uuid,
+                        sender_type="agent",
+                        message_type="brief",
+                        message=f"### INTERNAL ESCALATION BRIEF\n\n{conv.escalation_brief}",
+                        channel=state.get("channel", "website"),
+                        is_generated=True,
+                        is_handled=True,
+                    )
+                    session.add(system_msg)
+                    session.commit()
+                    logger.info(f"Escalated conversation {conversation_id} and saved brief.")
+            except Exception:
+                logger.exception("Error in node_human_review while generating brief")
+        
         interrupt("Human intervention required. Escalated by AI.")
-        return Command(goto="retrieve")
+        return Command(goto=END)
 
     g = StateGraph(AgentState)
     g.add_node("classify", node_classify)

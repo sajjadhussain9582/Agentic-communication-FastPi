@@ -13,7 +13,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-async def process_inbound_message(session: Session, channel: str, sender_details: dict[str, Any], message_body: str, subject: str = None):
+async def process_inbound_message(session: Session, channel: str, sender_details: dict[str, Any], message_body: str, subject: str = None) -> Conversation:
     logger.info(f"Processing inbound {channel} message from {sender_details} subject: {subject}")
     email = sender_details.get("email")
     phone = sender_details.get("phone")
@@ -98,3 +98,5 @@ async def process_inbound_message(session: Session, channel: str, sender_details
             )
     except Exception as e:
         logger.error(f"Error running AI pipeline: {e}")
+    
+    return conv

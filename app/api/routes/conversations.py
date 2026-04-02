@@ -215,7 +215,7 @@ async def post_conversation_message(
 
 
 @router.post("/{conversation_uuid}/inbound", response_model=InboundReplyRead)
-def post_conversation_inbound(
+async def post_conversation_inbound(
     conversation_uuid: str,
     body: InboundBody,
     session: Session = Depends(get_session),
@@ -246,7 +246,7 @@ def post_conversation_inbound(
     session.commit()
     session.refresh(inbound)
 
-    outbound = run_ai_pipeline(
+    outbound = await run_ai_pipeline(
         session=session,
         conversation=c,
         contact=contact,
@@ -309,6 +309,7 @@ def get_conversation(
         channel=c.channel,
         status=c.status,
         is_escalated=c.is_escalated,
+        escalation_brief=c.escalation_brief,
         last_intent=c.last_intent,
         qualification_stage=c.qualification_stage,
         messages=[

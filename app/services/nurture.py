@@ -27,9 +27,8 @@ def trigger_nurture_checkin(session: Session, contact: Contact):
     # We pass a synthetic internal message that signals a long-term check-in
     try:
         from app.services.ai_graph import run_ai_pipeline
-        # We pass a specific hint in the 'json_response' or just rely on 
-        # the 'is_proactive' logic we added earlier.
-        run_ai_pipeline(session, conv, contact)
+        import asyncio
+        asyncio.run(run_ai_pipeline(session, conv, contact))
         
         # Mark last outbound time
         contact.last_outbound_at = datetime.utcnow()

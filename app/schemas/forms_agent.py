@@ -21,9 +21,12 @@ class FormRead(BaseModel):
 
 
 class KnowledgeBaseCreate(BaseModel):
-    question: str
+    question: str = ""
     answer: str
     category: Optional[str] = None
+    source_type: str = "faq"
+    source_name: Optional[str] = None
+    storage_path: Optional[str] = None
 
 
 class KnowledgeBaseRead(BaseModel):
@@ -32,10 +35,30 @@ class KnowledgeBaseRead(BaseModel):
     question: str
     answer: str
     category: Optional[str] = None
+    source_type: str = "faq"
+    source_name: Optional[str] = None
+    storage_path: Optional[str] = None
+    chunk_index: Optional[int] = None
     has_embedding: bool = False
 
     class Config:
         from_attributes = True
+
+class KnowledgeBasePasteRequest(BaseModel):
+    content: str
+    source_name: str
+    category: Optional[str] = None
+
+class KnowledgeBaseUploadResponse(BaseModel):
+    ok: bool
+    source_name: str
+    chunks_created: int
+
+class KnowledgeBaseListResponse(BaseModel):
+    items: list[KnowledgeBaseRead]
+    total: int
+    skip: int
+    limit: int
 
 
 class MessageRead(BaseModel):

@@ -26,9 +26,13 @@ class KnowledgeBaseEntry(SQLModel, table=True):
         default_factory=_new_uuid,
         sa_column=Column("uuid", String(36), unique=True, index=True, nullable=True),
     )
-    question: str
+    question: str = Field(default="", index=True)
     answer: str
     category: Optional[str] = Field(default=None, index=True)
+    source_type: str = Field(default="faq", index=True) # faq, document
+    source_name: Optional[str] = Field(default=None, index=True)
+    storage_path: Optional[str] = Field(default=None, index=True)
+    chunk_index: Optional[int] = Field(default=None, index=True)
     keywords: list[Any] = Field(default_factory=list, sa_column=Column(JSON))
     intent_type: str | None = Field(default=None, index=True)
     role_type: str | None = Field(default=None, index=True)

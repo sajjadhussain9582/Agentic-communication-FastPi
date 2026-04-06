@@ -13,9 +13,15 @@ class Settings(BaseSettings):
     SUPABASE_ANON_KEY: str
     SUPABASE_KB_BUCKET: str = "MyBucket"
 
-    OPENAI_API_KEY: str = ""
-    OPENAI_CHAT_MODEL: str = "gpt-4o-mini"
-    OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
+    # OPENAI_API_KEY: str = ""
+    # OPENAI_CHAT_MODEL: str = "gpt-4o-mini"
+    # OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
+    GEMINI_API_KEY:str = ""
+    GEMINI_EMBEDDING_MODEL: str="gemini-embedding-001"
+    GROQ_API_KEY: str = ""
+    GROQ_CHAT_MODEL: str = "llama-3.3-70b-versatile"
+    EMBEDDING_DIM: int = 768
+    
     CALENDLY_BOOKING_URL: str = ""
     FORM_SUBMIT_API_KEY: str = ""  # If set, require X-API-Key header on public submit
     PUBLIC_APP_URL: str = ""  # Used in integration OAuth stub URLs

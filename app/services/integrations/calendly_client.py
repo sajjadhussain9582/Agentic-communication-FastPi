@@ -12,7 +12,7 @@ class CalendlyClient:
         if not integration:
             raise ValueError("Scheduling integration not found or not connected")
         config = integration.config_json or {}
-        self.access_token = config.get("token") or config.get("access_token")
+        self.access_token = config.get("access_token")
         if not self.access_token:
             raise ValueError("Scheduling access token not configured")
         self.user_uri = config.get("user_uri", "https://api.calendly.com/users/me")
@@ -21,28 +21,9 @@ class CalendlyClient:
             timeout=30.0
         )
 
-    async def resolve_user_uri(self) -> str:
-        """Fetch the actual user resource URI if it's currently set to the 'me' endpoint."""
-        if self.user_uri and "/users/me" not in self.user_uri:
-            return self.user_uri
-        
-        try:
-            resp = await self.client.get("https://api.calendly.com/users/me")
-            if resp.status_code == 200:
-                data = resp.json()
-                self.user_uri = data["resource"]["uri"]
-                return self.user_uri
-            else:
-                print(f"Failed to resolve Calendly user URI: {resp.text}")
-        except Exception as e:
-            print(f"Error resolving Calendly user URI: {e}")
-        
-        return "https://api.calendly.com/users/me" # Fallback if resolution fails
-
     async def get_booking_url(self, event_type_slug: str = "30min") -> str | None:
-        user_uri = await self.resolve_user_uri()
         try:
-            resp = await self.client.get(f"{user_uri}/event_types")
+            resp = await self.client.get(f"{self.user_uri}/event_types")
             if resp.status_code == 200:
                 data = resp.json()
                 for event_type in data.get("collection", []):
@@ -54,9 +35,8 @@ class CalendlyClient:
 
     async def get_scheduled_events(self, since: Optional[datetime] = None) -> dict:
         """Fetch scheduled events from Calendly API."""
-        user_uri = await self.resolve_user_uri()
         url = "https://api.calendly.com/scheduled_events"
-        params = {"user": user_uri}
+        params = {"user": self.user_uri}
         if since:
             params["min_start_time"] = since.isoformat()
         resp = await self.client.get(url, params=params)
@@ -65,65 +45,25 @@ class CalendlyClient:
     async def check_new_bookings(self, session, since: Optional[datetime] = None):
         """Check for new bookings and return associated contacts."""
         events = await self.get_scheduled_events(since)
-        if "error" in events:
-            print(f"Calendly API Error: {events['error']}")
-            return []
-            
-        collection = events.get("collection", [])
-        print(f"Calendly: Found {len(collection)} events in collection (since {since})")
-        
         new_bookings = []
-        for event in collection:
-            event_uri = event.get("uri")
-            print(f"Processing Calendly Event: {event.get('name')} ({event_uri})")
-            
-            # Fetch invitees for this specific event
-            try:
-                invitees_url = f"{event_uri}/invitees"
-                inv_resp = await self.client.get(invitees_url)
-                if inv_resp.status_code != 200:
-                    print(f"  Failed to fetch invitees for {event_uri}: {inv_resp.text}")
-                    continue
-                
-                invitees_data = inv_resp.json().get("collection", [])
-                print(f"  Found {len(invitees_data)} invitees for event.")
-                for invitee in invitees_data:
-                    invitee_email = invitee.get("email")
-                    if not invitee_email:
-                        continue
-                        
-                    print(f"  Checking invitee: {invitee_email}")
-                    
-                    # Find contact by email
-                    from app.models.contact import Contact
-                    from sqlmodel import select, or_
-                    # Search for exact email or email within <...>
-                    contact = session.exec(
-                        select(Contact).where(
-                            or_(
-                                Contact.email == invitee_email,
-                                Contact.email.ilike(f"%<{invitee_email}>%")
-                            )
-                        )
-                    ).first()
-                    
-                    if contact:
-                        print(f"  MATCH: Found contact {contact.id} for email {invitee_email}")
-                        new_bookings.append({
-                            "contact": contact,
-                            "event": event,
-                            "metadata": {
-                                "invitee_email": invitee_email,
-                                "invitee_uri": invitee.get("uri"),
-                                "event_uri": event_uri,
-                                "scheduled_start_time": event.get("start_time"),
-                                "event_type": "scheduled",
-                                "received_timestamp": datetime.utcnow().isoformat()
-                            }
-                        })
-                    else:
-                        print(f"  NO MATCH: No contact found for email {invitee_email}")
-            except Exception as e:
-                print(f"  Error processing invitees for event {event_uri}: {e}")
-                
+        for event in events.get("collection", []):
+            invitee_email = event.get("invitees", [{}])[0].get("email")
+            if invitee_email:
+                # Find contact by email (assuming session is SQLModel session)
+                from app.models.contact import Contact
+                from sqlmodel import select
+                contact = session.exec(select(Contact).where(Contact.email == invitee_email)).first()
+                if contact:
+                    new_bookings.append({
+                        "contact": contact,
+                        "event": event,
+                        "metadata": {
+                            "invitee_email": invitee_email,
+                            "invitee_uri": event.get("invitees", [{}])[0].get("uri"),
+                            "event_uri": event.get("uri"),
+                            "scheduled_start_time": event.get("start_time"),
+                            "event_type": "scheduled",  # Since polling
+                            "received_timestamp": datetime.utcnow().isoformat()
+                        }
+                    })
         return new_bookings

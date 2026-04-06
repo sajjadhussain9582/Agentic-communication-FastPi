@@ -19,7 +19,11 @@ os.environ["SUPABASE_URL"] = "http://localhost"
 os.environ["SUPABASE_SERVICE_ROLE_KEY"] = "test"
 os.environ["SUPABASE_ANON_KEY"] = "test"
 os.environ["REDIS_HOST"] = "localhost"
-os.environ["OPENAI_API_KEY"] = "sk-pytest-dummy"
+os.environ["GROQ_API_KEY"] = "groq-pytest-dummy"
+os.environ["GROQ_CHAT_MODEL"] = "llama-3.1-8b-instant"
+os.environ["GEMINI_API_KEY"] = "gemini-pytest-dummy"
+os.environ["GEMINI_EMBEDDING_MODEL"] = "gemini-embedding-001"
+os.environ["EMBEDDING_DIM"] = "768"
 os.environ["FORM_SUBMIT_API_KEY"] = ""
 
 from fastapi.testclient import TestClient

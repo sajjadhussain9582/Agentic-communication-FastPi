@@ -13,7 +13,7 @@ from app.services.ai_graph import MessageClassification
 
 from app.core.database import engine
 
-os.environ["OPENAI_API_KEY"] = "sk-dummy"
+os.environ["GROQ_API_KEY"] = "groq-dummy"
 
 def test_escalation_brief_generation(client):
     # 1. Setup: Create a contact and conversation
@@ -105,8 +105,9 @@ AI Notes (Internal):
 - Escalation triggered due to complex legal inquiry.
 """
 
-    with patch("app.services.ai_graph.ChatOpenAI") as MockLLM:
+    with patch("app.services.ai_graph.ChatGroq") as MockLLM, patch("app.services.ai_graph.search_similar") as mock_search:
         mock_llm_instance = MockLLM.return_value
+        mock_search.return_value = ([], [])
         
         # Mock for classification node
         mock_llm_instance.with_structured_output.return_value.invoke.return_value = mock_classification

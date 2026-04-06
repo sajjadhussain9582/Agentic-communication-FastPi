@@ -244,8 +244,7 @@ def check_stale_leads():
             logger.info(f"Worker: Re-engagement triggered for stale lead {contact.email or contact.username}")
             try:
                 from app.services.ai_graph import run_ai_pipeline
-                import asyncio
-                asyncio.run(run_ai_pipeline(session, conv, contact))
+                run_ai_pipeline(session, conv, contact)
                 # Mark outbound time on contact
                 contact.last_outbound_at = datetime.utcnow()
                 session.add(contact)
@@ -327,20 +326,19 @@ def check_calendly_bookings():
             last_checked_str = integration.config_json["last_calendly_check"]
             last_checked = datetime.fromisoformat(last_checked_str)
 
+        client = CalendlyClient(session)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
         try:
-            client = CalendlyClient(session)
             new_bookings = loop.run_until_complete(client.check_new_bookings(session, last_checked))
             if new_bookings:
-                logger.info(f"Worker: Found {len(new_bookings)} matched Calendly bookings to process.")
+                logger.info(f"Worker: Found {len(new_bookings)} new Calendly bookings.")
                 for booking in new_bookings:
                     contact = booking["contact"]
                     metadata = booking["metadata"]
                     
                     # Update contact pipeline stage
-                    old_stage = contact.pipeline_stage
                     contact.pipeline_stage = "meeting_booked"
                     contact.stage_entered_at = datetime.utcnow()
                     
@@ -370,9 +368,7 @@ def check_calendly_bookings():
                         )
                         session.add(booking_msg)
                     
-                    logger.info(f"Worker: Updated contact {contact.email} stage from {old_stage} to {contact.pipeline_stage}")
-            else:
-                logger.debug("Worker: No new Calendly bookings found in this cycle.")
+                    logger.info(f"Worker: Updated contact {contact.email} for Calendly booking.")
             
             # Update last checked time
             now = datetime.utcnow()
@@ -397,6 +393,6 @@ def start_worker():
     scheduler.add_job(check_stale_leads, 'interval', minutes=3, id='check_stale_leads')
     scheduler.add_job(check_qualified_leads, 'interval', hours=24, id='check_qualified_leads')
     scheduler.add_job(sync_contacts_to_hubspot, 'interval', minutes=5, id='sync_contacts_to_hubspot')
-    scheduler.add_job(check_calendly_bookings, 'interval', seconds=30, id='check_calendly_bookings')
+    scheduler.add_job(check_calendly_bookings, 'interval', minutes=5, id='check_calendly_bookings')
     scheduler.start()
     logger.info("Background worker initialized and started.")

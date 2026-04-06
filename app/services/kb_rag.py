@@ -79,21 +79,49 @@ def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     return dot / (na * nb)
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
-    if not settings.OPENAI_API_KEY:
-        raise ValueError("OPENAI_API_KEY is required for embeddings")
-    from openai import OpenAI
+def embed_texts(texts: list[str], *, task_type: str) -> list[list[float]]:
+    if not settings.GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY is required for embeddings")
+    if not settings.GEMINI_EMBEDDING_MODEL:
+        raise ValueError("GEMINI_EMBEDDING_MODEL is required for embeddings")
 
-    client = OpenAI(api_key=settings.OPENAI_API_KEY)
-    resp = client.embeddings.create(
-        model=settings.OPENAI_EMBEDDING_MODEL,
-        input=texts,
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=settings.GEMINI_API_KEY)
+
+    cfg = types.EmbedContentConfig(
+        task_type=task_type,
+        output_dimensionality=(settings.EMBEDDING_DIM or None),
     )
-    return [d.embedding for d in resp.data]
+
+    try:
+        resp = client.models.embed_content(
+            model=settings.GEMINI_EMBEDDING_MODEL,
+            contents=texts,
+            config=cfg,
+        )
+    except TypeError:
+        resp = client.models.embed_content(
+            model=settings.GEMINI_EMBEDDING_MODEL,
+            contents=texts,
+        )
+
+    vectors = [e.values for e in (resp.embeddings or [])]
+    if len(vectors) != len(texts):
+        raise ValueError("Embedding count mismatch")
+
+    expected_dim = int(settings.EMBEDDING_DIM or 0)
+    if expected_dim:
+        for v in vectors:
+            if len(v) != expected_dim:
+                raise ValueError(f"Embedding dim mismatch: expected {expected_dim}, got {len(v)}")
+
+    return vectors
 
 
-def embed_single(text_str: str) -> list[float]:
-    return embed_texts([text_str])[0]
+def embed_single(text_str: str, *, task_type: str) -> list[float]:
+    return embed_texts([text_str], task_type=task_type)[0]
 
 
 def _build_combined_text(entry: KnowledgeBaseEntry) -> str:
@@ -109,7 +137,7 @@ def _build_combined_text(entry: KnowledgeBaseEntry) -> str:
 def ensure_entry_embedding(session: Session, entry: KnowledgeBaseEntry) -> None:
     """Generate embedding and write to BOTH embedding_json AND pgvector column."""
     combined = _build_combined_text(entry)
-    vec = embed_single(combined)
+    vec = embed_single(combined, task_type="RETRIEVAL_DOCUMENT")
 
     # Legacy JSON column
     entry.embedding_json = json.dumps(vec)
@@ -141,7 +169,7 @@ def search_similar(
     """Search KB via Postgres match_knowledge_base(), with Python fallback."""
     query = normalize_query(query)
     try:
-        qvec = embed_single(query)
+        qvec = embed_single(query, task_type="RETRIEVAL_QUERY")
     except Exception:
         logger.warning("Failed to embed query: %s", query[:80])
         return [], []

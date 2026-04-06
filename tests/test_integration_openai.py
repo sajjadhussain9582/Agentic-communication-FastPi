@@ -1,4 +1,4 @@
-"""Optional: run with OPENAI_API_KEY set and pytest -m integration."""
+"""Optional: run with GROQ_API_KEY + GEMINI_API_KEY set and pytest -m integration."""
 
 import os
 
@@ -27,8 +27,11 @@ def _has_budget_timeline_range(text: str) -> bool:
     )
 
 
-@pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
-def test_form_submit_with_openai(client):
+@pytest.mark.skipif(
+    not (os.environ.get("RUN_INTEGRATION_AI") and os.environ.get("GROQ_API_KEY") and os.environ.get("GEMINI_API_KEY")),
+    reason="RUN_INTEGRATION_AI + GROQ_API_KEY + GEMINI_API_KEY required",
+)
+def test_form_submit_with_ai(client):
     _, _, token = register_and_login(client)
     h = bearer(token)
     fid = client.get("/api/v1/forms", headers=h).json()[0]["id"]
@@ -52,7 +55,10 @@ def test_form_submit_with_openai(client):
     assert "contractors" in data["ai_reply"].lower() or "partners" in data["ai_reply"].lower()
 
 
-@pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
+@pytest.mark.skipif(
+    not (os.environ.get("RUN_INTEGRATION_AI") and os.environ.get("GROQ_API_KEY") and os.environ.get("GEMINI_API_KEY")),
+    reason="RUN_INTEGRATION_AI + GROQ_API_KEY + GEMINI_API_KEY required",
+)
 def test_budget_question_gets_concrete_ranges(client):
     _, _, token = register_and_login(client)
     h = bearer(token)

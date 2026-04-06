@@ -111,7 +111,7 @@ def seed_if_empty(session: Session) -> None:
         )
         session.add(e)
     session.commit()
-    if settings.OPENAI_API_KEY:
+    if settings.GEMINI_API_KEY:
         for e in session.exec(select(KnowledgeBaseEntry)).all():
             if not e.embedding_json:
                 try:

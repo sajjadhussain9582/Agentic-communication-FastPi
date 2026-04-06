@@ -10,7 +10,7 @@ from decimal import Decimal
 from typing import Any, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from langchain_groq import ChatGroq
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg_pool import ConnectionPool
@@ -36,6 +36,30 @@ logger = logging.getLogger(__name__)
 
 def _rag_debug_enabled() -> bool:
     return os.getenv("RAG_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+
+def should_include_cta(
+    *,
+    conversation_turn: int,
+    cta_readiness_score: int | float,
+    missing_fields: list[str] | None,
+    conversation_stage: str | None,
+) -> bool:
+    stage = (conversation_stage or "").strip().lower()
+    turn = int(conversation_turn or 1)
+    score = float(cta_readiness_score or 0)
+    missing = [m for m in (missing_fields or []) if str(m).strip()]
+
+    if stage in ("proposal_ready", "meeting_booked", "qualified", "negotiation", "won"):
+        return True
+    if turn <= 1:
+        return True
+    if score >= 80:
+        return True
+    if stage in ("requirements_gathering", "discovery") and len(missing) >= 3 and score < 60:
+        return False
+    if score < 30 and len(missing) >= 2:
+        return False
+    return True
 
 # Global checkpointer for human-in-the-loop interrupts
 _memory_saver = MemorySaver()
@@ -681,13 +705,16 @@ def _format_estimator_context(user_text: str, slots: dict[str, Any]) -> str:
 
 
 def build_graph(session: Session):
-    if not settings.OPENAI_API_KEY:
-        raise ValueError("OPENAI_API_KEY required")
+    if not settings.GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY required")
+    if not settings.GROQ_CHAT_MODEL:
+        raise ValueError("GROQ_CHAT_MODEL required")
 
-    llm = ChatOpenAI(
-        api_key=settings.OPENAI_API_KEY,
-        model=settings.OPENAI_CHAT_MODEL,
+    llm = ChatGroq(
+        model=settings.GROQ_CHAT_MODEL,
         temperature=0.2,
+
+        api_key=settings.GROQ_API_KEY,
     )
 
     def node_classify(state: AgentState) -> Command:

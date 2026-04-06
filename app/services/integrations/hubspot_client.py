@@ -155,3 +155,36 @@ class HubSpotClient:
                 return {"ok": False, "error": response.text}
             
             return {"ok": True, "data": response.json()}
+
+    async def create_ticket(self, properties: Dict[str, Any], contact_id: Optional[str] = None) -> Dict[str, Any]:
+        """Creates a ticket in HubSpot and optionally associates it with a contact."""
+        token = await self.get_valid_access_token()
+        
+        payload = {"properties": properties}
+        
+        # Add association if contact_id is provided
+        if contact_id:
+            payload["associations"] = [
+                {
+                    "to": {"id": contact_id},
+                    "types": [
+                        {
+                            "associationCategory": "HUBSPOT_DEFINED",
+                            "associationTypeId": 16  # Contact to Ticket association
+                        }
+                    ]
+                }
+            ]
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{HUBSPOT_API_BASE}/crm/v3/objects/tickets",
+                headers={"Authorization": f"Bearer {token}"},
+                json=payload
+            )
+            
+            if response.status_code not in (200, 201):
+                logger.error(f"Failed to create HubSpot ticket: {response.text}")
+                return {"ok": False, "error": response.text}
+            
+            return {"ok": True, "data": response.json()}

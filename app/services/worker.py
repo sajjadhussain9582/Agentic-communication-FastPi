@@ -31,27 +31,30 @@ def sync_contacts_to_hubspot():
         if not integration:
             return
 
-        # Fetch contacts with status or pipeline_stage 'qualified'
+        # Fetch contacts with status or pipeline_stage 'qualified' or 'meeting_booked'
         contacts = session.exec(
             select(Contact).where(
                 or_(
                     Contact.status == "qualified",
+                    Contact.status == "meeting_booked",
                     Contact.pipeline_stage == "qualified",
-                    Contact.stage == "qualified"
+                    Contact.pipeline_stage == "meeting_booked",
+                    Contact.stage == "qualified",
+                    Contact.stage == "meeting_booked"
                 )
             )
         ).all()
         if not contacts:
             return
 
-        logger.info(f"Worker: Found {len(contacts)} qualified contacts for HubSpot sync.")
+        logger.info(f"Worker: Found {len(contacts)} leads for HubSpot sync.")
         _perform_hubspot_sync(session, contacts)
 
 def sync_single_contact_to_hubspot_task(contact_id: int):
-    """Background task to sync a single contact immediately if qualified."""
+    """Background task to sync a single contact immediately if qualified or meeting booked."""
     with Session(engine) as session:
         contact = session.get(Contact, contact_id)
-        if contact and contact.status == "qualified":
+        if contact and (contact.status == "qualified" or contact.status == "meeting_booked"):
             _perform_hubspot_sync(session, [contact])
         else:
             logger.info(f"Worker: Skipping HubSpot sync for contact {contact_id} (status: {contact.status if contact else 'None'})")
@@ -90,6 +93,10 @@ def _perform_hubspot_sync(session: Session, contacts: list[Contact]):
                 # Translate internal values to HubSpot options
                 hs_status = STATUS_MAP.get((c.status or "new").lower(), "NEW")
                 hs_lifecycle = STAGE_MAP.get((c.pipeline_stage or "discovery").lower(), "lead")
+                
+                # If meeting_booked, ensure lifecycle stage reflects that
+                if c.status == "meeting_booked" or c.pipeline_stage == "meeting_booked":
+                    hs_lifecycle = "opportunity"
 
                 props = {
                     "email": clean_email,
@@ -112,6 +119,29 @@ def _perform_hubspot_sync(session: Session, contacts: list[Contact]):
                         c.external_ids["hubspot_id"] = hs_id
                         session.add(c)
                         logger.info(f"HubSpot Sync: Success for {clean_email} (ID: {hs_id})")
+
+                        # Create ticket for qualified or meeting_booked leads
+                        is_qualified = c.status == "qualified" or c.pipeline_stage == "qualified"
+                        is_meeting = c.status == "meeting_booked" or c.pipeline_stage == "meeting_booked"
+
+                        if is_qualified or is_meeting:
+                            ticket_type = "Meeting Booked" if is_meeting else "Qualified Lead"
+                            ticket_key = f"hubspot_ticket_{ticket_type.lower().replace(' ', '_')}_id"
+                            if c.external_ids and c.external_ids.get(ticket_key):
+                                logger.info(f"HubSpot Sync: Ticket ({ticket_type}) already exists for {clean_email}")
+                                continue
+                            ticket_props = {
+                                "subject": f"{ticket_type}: {c.username or clean_email}",
+                                "hs_pipeline": "0",  # Default ticket pipeline
+                                "hs_pipeline_stage": "1",  # 'New' stage in ticket pipeline
+                                "hs_ticket_priority": "HIGH" if is_qualified else "URGENT",
+                                "content": f"Lead status: {c.status}\nProject: {c.project_type or 'N/A'}\nBudget: {c.budget or 'N/A'}\nTimeline: {c.timeline or 'N/A'}"
+                            }
+                            ticket_res = loop.run_until_complete(hubspot.create_ticket(ticket_props, contact_id=hs_id))
+                            if ticket_res.get("ok"):
+                                logger.info(f"HubSpot Sync: Ticket created for {clean_email} ({ticket_type})")
+                            else:
+                                logger.error(f"HubSpot Sync: Failed to create ticket: {ticket_res.get('error')}")
                 else:
                     logger.error(f"HubSpot Sync: Failed for {c.email}: {res.get('error')}")
             except Exception as e:

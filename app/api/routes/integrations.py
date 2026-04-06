@@ -264,6 +264,9 @@ def authorize_hubspot():
         "crm.objects.owners.read",
         "crm.schemas.contacts.read",
         "crm.schemas.contacts.write",
+        "oauth",
+        "tickets",
+
 
     ]
     

@@ -26,19 +26,21 @@ def _verify_ghl_webhook(request: Request) -> None:
 
 
 def _upsert_contact_from_payload(session: Session, body: dict[str, Any]) -> Contact:
-    email = body.get("email") or body.get("contact_email")
+    raw_email = body.get("email") or body.get("contact_email")
     phone = body.get("phone") or body.get("contact_phone")
     name = body.get("name") or body.get("contact_name") or "GHL Contact"
     company = body.get("company")
+    
+    email = str(raw_email).strip().lower() if raw_email else None
 
     row = None
     if email:
-        row = session.exec(select(Contact).where(Contact.email == str(email))).first()
+        row = session.exec(select(Contact).where(Contact.email == email)).first()
     if not row and phone:
         row = session.exec(select(Contact).where(Contact.phone == str(phone))).first()
     if not row:
         row = Contact(
-            email=str(email) if email else None,
+            email=email,
             phone=str(phone) if phone else None,
             username=str(name)[:255],
             company=str(company)[:255] if company else None,

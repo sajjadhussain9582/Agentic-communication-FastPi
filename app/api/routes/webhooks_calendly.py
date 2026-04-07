@@ -40,11 +40,13 @@ async def calendly_webhook(
 
 async def handle_invitee_created(payload: Dict[str, Any], session: Session):
     data = payload.get("payload", {})
-    email = data.get("email")
+    raw_email = data.get("email")
     name = data.get("name")
     
-    if not email:
+    if not raw_email:
         return
+    
+    email = raw_email.strip().lower()
     
     # Find or create contact
     contact = session.exec(select(Contact).where(Contact.email == email)).first()
@@ -52,11 +54,12 @@ async def handle_invitee_created(payload: Dict[str, Any], session: Session):
         contact = Contact(
             email=email,
             username=name or email.split("@")[0],
-            status="lead",
-            pipeline_stage="consultation"
+            status="meeting_booked",
+            pipeline_stage="meeting_booked"
         )
     else:
-        contact.pipeline_stage = "consultation"
+        contact.pipeline_stage = "meeting_booked"
+        contact.status = "meeting_booked"
     
     session.add(contact)
     session.commit()

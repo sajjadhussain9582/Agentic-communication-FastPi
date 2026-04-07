@@ -114,11 +114,19 @@ def _perform_hubspot_sync(session: Session, contacts: list[Contact]):
                     results = res.get("data", {}).get("results", [])
                     if results:
                         hs_id = results[0].get("id")
-                        if not c.external_ids:
-                            c.external_ids = {}
-                        c.external_ids["hubspot_id"] = hs_id
+                        
+                        # Refresh contact from DB to get the most recent external_ids
+                        session.refresh(c)
+                        
+                        ext = dict(c.external_ids or {})
+                        ext["hubspot_id"] = hs_id
+                        c.external_ids = ext
+                        
                         session.add(c)
-                        logger.info(f"HubSpot Sync: Success for {clean_email} (ID: {hs_id})")
+                        session.commit()
+                        session.refresh(c) # Refresh again after commit
+                        
+                        logger.info(f"HubSpot Sync: Contact {clean_email} synced (ID: {hs_id})")
 
                         # Create ticket for qualified or meeting_booked leads
                         is_qualified = c.status == "qualified" or c.pipeline_stage == "qualified"
@@ -127,19 +135,35 @@ def _perform_hubspot_sync(session: Session, contacts: list[Contact]):
                         if is_qualified or is_meeting:
                             ticket_type = "Meeting Booked" if is_meeting else "Qualified Lead"
                             ticket_key = f"hubspot_ticket_{ticket_type.lower().replace(' ', '_')}_id"
+                            
+                            # CRITICAL: Re-check external_ids after refreshing from DB
                             if c.external_ids and c.external_ids.get(ticket_key):
-                                logger.info(f"HubSpot Sync: Ticket ({ticket_type}) already exists for {clean_email}")
+                                logger.info(f"HubSpot Sync: Ticket ({ticket_type}) already exists for {clean_email}, skipping.")
                                 continue
+                                
+                            logger.info(f"HubSpot Sync: Creating {ticket_type} ticket for {clean_email}...")
+                            
                             ticket_props = {
                                 "subject": f"{ticket_type}: {c.username or clean_email}",
-                                "hs_pipeline": "0",  # Default ticket pipeline
-                                "hs_pipeline_stage": "1",  # 'New' stage in ticket pipeline
+                                "hs_pipeline": "0",
+                                "hs_pipeline_stage": "1",
                                 "hs_ticket_priority": "HIGH" if is_qualified else "URGENT",
                                 "content": f"Lead status: {c.status}\nProject: {c.project_type or 'N/A'}\nBudget: {c.budget or 'N/A'}\nTimeline: {c.timeline or 'N/A'}"
                             }
+                            
                             ticket_res = loop.run_until_complete(hubspot.create_ticket(ticket_props, contact_id=hs_id))
                             if ticket_res.get("ok"):
-                                logger.info(f"HubSpot Sync: Ticket created for {clean_email} ({ticket_type})")
+                                ticket_id = ticket_res.get("data", {}).get("id")
+                                
+                                # Refresh again before saving ticket ID to handle any concurrent updates
+                                session.refresh(c)
+                                ext = dict(c.external_ids or {})
+                                ext[ticket_key] = ticket_id
+                                c.external_ids = ext
+                                
+                                session.add(c)
+                                session.commit()
+                                logger.info(f"HubSpot Sync: Ticket created for {clean_email} ({ticket_type}) ID: {ticket_id}")
                             else:
                                 logger.error(f"HubSpot Sync: Failed to create ticket: {ticket_res.get('error')}")
                 else:
@@ -274,7 +298,14 @@ def check_stale_leads():
             logger.info(f"Worker: Re-engagement triggered for stale lead {contact.email or contact.username}")
             try:
                 from app.services.ai_graph import run_ai_pipeline
-                run_ai_pipeline(session, conv, contact)
+                # Fixed: run_ai_pipeline is async, must be run within a loop or awaited
+                # Since this worker function is sync, we use a loop
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(run_ai_pipeline(session, conv, contact))
+                finally:
+                    loop.close()
                 # Mark outbound time on contact
                 contact.last_outbound_at = datetime.utcnow()
                 session.add(contact)
@@ -342,12 +373,14 @@ def check_qualified_leads():
 
 def check_calendly_bookings():
     """Check for new Calendly bookings and update lead status."""
+    logger.info("Worker: Starting check_calendly_bookings...")
     with Session(engine) as session:
         integration = session.exec(
             select(Integration).where(Integration.provider == "scheduling", Integration.status == "connected")
         ).first()
         
         if not integration:
+            logger.info("Worker: No connected scheduling integration found.")
             return
 
         # Get last checked time from config
@@ -355,30 +388,54 @@ def check_calendly_bookings():
         if integration.config_json and "last_calendly_check" in integration.config_json:
             last_checked_str = integration.config_json["last_calendly_check"]
             last_checked = datetime.fromisoformat(last_checked_str)
+            logger.info(f"Worker: Last Calendly check was at {last_checked_str}")
 
         client = CalendlyClient(session)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
         try:
+            logger.info(f"Worker: Fetching new bookings since {last_checked}...")
             new_bookings = loop.run_until_complete(client.check_new_bookings(session, last_checked))
             if new_bookings:
-                logger.info(f"Worker: Found {len(new_bookings)} new Calendly bookings.")
+                logger.info(f"Worker: Found {len(new_bookings)} new Calendly bookings to process.")
                 for booking in new_bookings:
                     contact = booking["contact"]
                     metadata = booking["metadata"]
                     
+                    logger.info(f"Worker: Processing booking for contact {contact.email}...")
+                    
+                    # Update contact username if it's missing or generic
+                    new_name = metadata.get("invitee_name")
+                    if new_name and (not contact.username or contact.username == contact.email.split("@")[0]):
+                        contact.username = new_name
+                        logger.info(f"Worker: Updated username for {contact.email} to {new_name}")
+
                     # Update contact pipeline stage
                     contact.pipeline_stage = "meeting_booked"
+                    contact.status = "meeting_booked"
+                    contact.stage = "meeting_booked"
                     contact.stage_entered_at = datetime.utcnow()
                     
-                    # Store metadata in external_ids
-                    if not contact.external_ids:
-                        contact.external_ids = {}
-                    if "calendly" not in contact.external_ids:
-                        contact.external_ids["calendly"] = []
-                    contact.external_ids["calendly"].append(metadata)
+                    # Also update pipeline_stage_id by looking up the stage record
+                    stage_record = session.exec(
+                        select(PipelineStage).where(PipelineStage.key == "meeting_booked")
+                    ).first()
+                    if stage_record:
+                        contact.pipeline_stage_id = stage_record.id
                     
+                    # Store metadata in external_ids
+                    ext = dict(contact.external_ids or {})
+                    if "calendly" not in ext:
+                        ext["calendly"] = []
+                    
+                    # Avoid duplicates in the list
+                    invitee_uri = metadata.get("invitee_uri")
+                    if invitee_uri not in [b.get("invitee_uri") for b in ext["calendly"] if isinstance(b, dict)]:
+                        ext["calendly"].append(metadata)
+                        logger.info(f"Worker: Added Calendly metadata for {contact.email}")
+                    
+                    contact.external_ids = ext
                     session.add(contact)
                     
                     # Find conversation and add a message
@@ -397,20 +454,24 @@ def check_calendly_bookings():
                             is_handled=True,
                         )
                         session.add(booking_msg)
+                        logger.info(f"Worker: Added system message for booking to conversation {conv.id}")
                     
                     logger.info(f"Worker: Updated contact {contact.email} for Calendly booking.")
+            else:
+                logger.info("Worker: No new bookings found in this cycle.")
             
             # Update last checked time
             now = datetime.utcnow()
-            if not integration.config_json:
-                integration.config_json = {}
-            integration.config_json["last_calendly_check"] = now.isoformat()
+            config = dict(integration.config_json or {})
+            config["last_calendly_check"] = now.isoformat()
+            integration.config_json = config
             integration.last_sync_at = now
             session.add(integration)
             session.commit()
+            logger.info(f"Worker: Updated Calendly check checkpoint to {now.isoformat()}")
             
         except Exception as e:
-            logger.error(f"Worker: Error checking Calendly bookings: {e}")
+            logger.error(f"Worker: Error checking Calendly bookings: {e}", exc_info=True)
         finally:
             loop.close()
 
@@ -418,11 +479,11 @@ scheduler = BackgroundScheduler()
 
 def start_worker():
     # Low frequency for stability
-    scheduler.add_job(check_incoming_emails, 'interval', seconds=60, id='check_incoming_emails')
+    scheduler.add_job(check_incoming_emails, 'interval', seconds=30, id='check_incoming_emails')
     scheduler.add_job(check_queued_messages, 'interval', minutes=1, id='check_queued_messages')
     scheduler.add_job(check_stale_leads, 'interval', minutes=3, id='check_stale_leads')
     scheduler.add_job(check_qualified_leads, 'interval', hours=24, id='check_qualified_leads')
-    scheduler.add_job(sync_contacts_to_hubspot, 'interval', minutes=5, id='sync_contacts_to_hubspot')
-    scheduler.add_job(check_calendly_bookings, 'interval', minutes=5, id='check_calendly_bookings')
+    scheduler.add_job(sync_contacts_to_hubspot, 'interval', seconds=30, id='sync_contacts_to_hubspot')
+    scheduler.add_job(check_calendly_bookings, 'interval', minutes=1, id='check_calendly_bookings')
     scheduler.start()
     logger.info("Background worker initialized and started.")

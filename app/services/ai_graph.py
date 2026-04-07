@@ -223,7 +223,7 @@ You MUST output ONLY valid JSON with the following keys:
 - project_scope: string or null
 - decision_authority: string or null
 - geography: string or null
-- new_pipeline_stage: one of: discovery, qualified, consultation, proposal_ready, negotiation, won, lost
+- new_pipeline_stage: one of: discovery, qualified, meeting_booked, proposal_ready, negotiation, won, lost
 - close_readiness_score: number between 0-100
 - requires_action: array of actions from: update_status, send_calendly, send_proposal
 - missing_qualification_fields: array from: scope, budget, timeline, location, stakeholders, constraints
@@ -245,7 +245,7 @@ You MUST follow these rules when setting new_pipeline_stage:
   - budget or budget_signal
   - timeline or timeline_signal
 
-- consultation:
+- meeting_booked:
   ONLY if:
   - qualified conditions are met
   AND
@@ -285,7 +285,7 @@ MISSING FIELD HARD CONSTRAINTS
 
 - If budget OR timeline is missing → MUST NOT exceed "discovery"
 - If scope is missing → MUST NOT exceed "qualified"
-- If stakeholders/decision authority missing → MUST NOT exceed "consultation"
+- If stakeholders/decision authority missing → MUST NOT exceed "meeting_booked"
 
 --------------------------------
 LEAD SCORING RULES (0–100)
@@ -445,7 +445,7 @@ Current stage: {stage_key}
   - if user shows intent → include booking link
   - otherwise soft CTA or continue qualification
 
-- consultation:
+- meeting_booked:
   - provide booking link directly
   - minimize additional questions
 
@@ -471,7 +471,7 @@ CTA RULES
 --------------------------------
 
 - ONLY include booking link if:
-  - stage is consultation or higher
+  - stage is meeting_booked or higher
   OR
   - user explicitly asks for meeting/link
 

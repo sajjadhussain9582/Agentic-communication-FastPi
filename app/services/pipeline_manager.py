@@ -9,14 +9,13 @@ logger = logging.getLogger(__name__)
 # Master Pipeline Configuration (Business Logic Layer)
 # Each stage has 'required_slots' that must be filled before entry.
 PIPELINE_STAGES = {
-    "lead": {"required_slots": []},
-    "discovery": {"required_slots": ["project_type"]},
+    "discovery": {"required_slots": []},
     "qualified": {"required_slots": ["project_type", "budget_signal", "timeline_signal"]},
-    "consultation": {"required_slots": ["project_type", "budget_signal", "timeline_signal", "scope"]},
-    "proposal": {"required_slots": ["project_type", "budget_signal", "timeline_signal", "scope", "stakeholders"]},
+    "meeting_booked": {"required_slots": ["project_type", "budget_signal", "timeline_signal", "scope"]},
+    "proposal_ready": {"required_slots": ["project_type", "budget_signal", "timeline_signal", "scope", "stakeholders"]},
 }
 
-PIPELINE_ORDER = ["lead", "discovery", "qualified", "consultation", "proposal"]
+PIPELINE_ORDER = ["discovery", "qualified", "meeting_booked", "proposal_ready"]
 
 def sync_pipeline_stage(session: Session, contact: Contact, ai_decision: Dict[str, Any]):
     """
@@ -24,9 +23,9 @@ def sync_pipeline_stage(session: Session, contact: Contact, ai_decision: Dict[st
     This ensures the AI doesn't skip stages or 'guess' its way into 
     a qualified state without the minimum required evidence.
     """
-    current_stage = contact.pipeline_stage or "lead"
+    current_stage = contact.pipeline_stage or "discovery"
     if current_stage not in PIPELINE_STAGES:
-        current_stage = "lead"
+        current_stage = "discovery"
 
     # 1. Gather all filled slots (from contact history + current turn)
     # We prioritize the AI's 'filled_fields' but fallback to DB fields.

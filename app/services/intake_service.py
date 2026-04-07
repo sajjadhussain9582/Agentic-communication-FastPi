@@ -24,12 +24,11 @@ def _default_placeholder_reply() -> str:
 
 async def process_inbound_message(session: Session, channel: str, sender_details: dict[str, Any], message_body: str, subject: str = None) -> Conversation:
     logger.info(f"Processing inbound {channel} message from {sender_details} subject: {subject}")
-    email = sender_details.get("email")
+    raw_email = sender_details.get("email")
     phone = sender_details.get("phone")
     name = sender_details.get("name")
-    email = sender_details.get("email")
-    phone = sender_details.get("phone")
-    name = sender_details.get("name")
+    
+    email = raw_email.strip().lower() if raw_email else None
 
     contact = None
     if email or phone:

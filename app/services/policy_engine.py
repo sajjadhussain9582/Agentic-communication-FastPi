@@ -35,10 +35,9 @@ def validate_action(contact: Contact, action: str) -> bool:
     
     # Flexible mapping: if the stage name implies progress, allow the action
     stage_map = {
-        "lead": 0,
-        "new": 0,
-        "discovery": 1,
-        "qualified": 2,
+        "discovery": 0,
+        "qualified": 1,
+        "meeting_booked": 2,
         "proposal_ready": 3,
         "negotiation": 4,
         "won": 5,
@@ -46,7 +45,7 @@ def validate_action(contact: Contact, action: str) -> bool:
         "not_qualified": 0
     }
     
-    current_stage = (contact.pipeline_stage or "lead").lower().strip()
+    current_stage = (contact.pipeline_stage or "discovery").lower().strip()
     current_idx = stage_map.get(current_stage, 0)
     
     if current_idx < policy["min_stage_index"]:

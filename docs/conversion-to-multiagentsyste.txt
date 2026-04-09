@@ -1,0 +1,343 @@
+# 🚀 UPGRADE LangGraph TO PRODUCTION MULTI-AGENT SALES SYSTEM
+
+## 🎯 OBJECTIVE
+
+Transform my existing **single-agent LangGraph pipeline** into a **production-ready multi-agent sales system** for B2B real-estate/construction.
+
+The system must:
+
+* Use **tool-calling agents with loops**
+* Have **3 specialized agents + supervisor routing**
+* Preserve **ALL existing DB logic (PostgresSaver, Contact, Conversation, Message, pipeline stages)**
+* Support **streaming responses for Next.js chat UI**
+* Optimize for **sales conversion (qualification → estimation → booking)**
+
+---
+
+## ⚠️ NON-NEGOTIABLE RULES
+
+* ❌ DO NOT break existing DB models or API
+* ❌ DO NOT remove existing nodes (classify, updatestatus, draft, humanreview)
+* ❌ DO NOT move classification into agents
+* ✅ KEEP MessageClassification as-is
+* ✅ KEEP PostgresSaver checkpointer
+* ✅ KEEP pipeline stage updates
+
+---
+
+## 🧠 TARGET ARCHITECTURE
+
+START
+↓
+classify (existing)
+↓
+supervisor_router
+↓
+QualifierAgent (RAG + missing info)
+↓
+EstimatorAgent (pricing + timeline via tool)
+↓
+DrafterAgent (reply + CTA + Calendly)
+↓
+update_status (existing DB sync)
+↓
+END
+
+Escalation → humanreview (existing)
+
+---
+
+## 🛠 STEP 1: IMPORTS & TOOLS
+
+```python
+from langgraph.prebuilt import ToolNode, tools_condition, create_react_agent
+from pydantic import BaseModel, Field
+from typing import Optional
+```
+
+### Tools (must use existing functions internally)
+
+```python
+class RAGTool(BaseModel):
+    """Search knowledge base"""
+    query: str
+
+    def __call__(self):
+        return searchsimilar(self.query)
+
+
+class EstimatorTool(BaseModel):
+    """Estimate project cost and timeline"""
+    project_desc: str
+
+    def __call__(self):
+        return estimateproject(self.project_desc)
+
+
+class CalendlyTool(BaseModel):
+    """Generate booking link"""
+    duration: Optional[str] = "30min"
+
+    async def __call__(self):
+        return await calendly.getbookingurl(self.duration)
+```
+
+---
+
+## 🧠 STEP 2: LLM
+
+```python
+llm_base = ChatGroq(
+    model=settings.GROQCHATMODEL,
+    temperature=0.1,
+    api_key=settings.GROQAPIKEY
+)
+```
+
+---
+
+## 🤖 STEP 3: AGENTS
+
+### 1. Qualifier Agent
+
+```python
+qualifier = create_react_agent(
+    llm_base,
+    tools=[RAGTool()],
+    prompt="""
+You are a sales qualification agent.
+
+Goals:
+- Understand project scope
+- Identify missing info (budget, timeline, ownership)
+- Use RAG tool for company/services context
+- Ask smart follow-up questions
+
+Rules:
+- Do NOT hallucinate
+- If missing key data → ask question
+- Be concise and natural
+"""
+)
+```
+
+---
+
+### 2. Estimator Agent
+
+```python
+estimator = create_react_agent(
+    llm_base,
+    tools=[EstimatorTool()],
+    prompt="""
+You estimate project cost and timeline.
+
+Rules:
+- If enough data → MUST call EstimatorTool
+- If missing info → ask follow-up
+- Provide realistic estimates (not optimistic)
+"""
+)
+```
+
+---
+
+### 3. Drafter Agent (SALES CRITICAL)
+
+```python
+drafter = create_react_agent(
+    llm_base,
+    tools=[CalendlyTool()],
+    prompt=f"""
+{REPLY_PROMPT}
+
+You are a high-performing sales closer.
+
+Rules:
+- If leadscore > 70 → include booking link
+- If qualified → push consultation
+- If user is hesitant → reduce friction
+- If user is ready → move fast to booking
+
+Never:
+- Be passive
+- Delay CTA
+"""
+)
+```
+
+---
+
+## 🧠 STEP 4: SUPERVISOR ROUTER
+
+```python
+def route_after_classify(state: AgentState):
+    classification = state.get("classification")
+
+    if not classification:
+        return "qualifier"
+
+    if classification.isescalated:
+        return "humanreview"
+
+    if classification.intenttype in ["pricingrequest", "quote", "budget"]:
+        return "estimator"
+
+    if classification.newpipelinestage in ["qualified", "meetingbooked"]:
+        return "drafter"
+
+    return "qualifier"
+```
+
+---
+
+## 🔁 STEP 5: GRAPH BUILD
+
+```python
+def buildgraph(session: Session):
+    g = StateGraph(AgentState)
+
+    # Existing nodes
+    g.add_node("classify", node_classify)
+    g.add_node("updatestatus", node_update_status)
+    g.add_node("humanreview", nodehumanreview)
+
+    # Agents
+    g.add_node("qualifier", qualifier)
+    g.add_node("estimator", estimator)
+    g.add_node("drafter", drafter)
+
+    # Tool nodes (separate per agent)
+    g.add_node("qualifier_tools", ToolNode([RAGTool()]))
+    g.add_node("estimator_tools", ToolNode([EstimatorTool()]))
+    g.add_node("drafter_tools", ToolNode([CalendlyTool()]))
+
+    # Entry
+    g.set_entry_point("classify")
+
+    # Routing
+    g.add_conditional_edges(
+        "classify",
+        route_after_classify,
+        {
+            "qualifier": "qualifier",
+            "estimator": "estimator",
+            "drafter": "drafter",
+            "humanreview": "humanreview"
+        }
+    )
+
+    # Tool loops
+    g.add_conditional_edges("qualifier", tools_condition)
+    g.add_edge("qualifier_tools", "qualifier")
+
+    g.add_conditional_edges("estimator", tools_condition)
+    g.add_edge("estimator_tools", "estimator")
+
+    g.add_conditional_edges("drafter", tools_condition)
+    g.add_edge("drafter_tools", "drafter")
+
+    # Flow chaining
+    g.add_edge("qualifier", "estimator")
+    g.add_edge("estimator", "drafter")
+
+    # Final
+    g.add_edge("drafter", "updatestatus")
+    g.add_edge("updatestatus", END)
+
+    return g.compile(
+        checkpointer=getcheckpointer(),
+        interrupt_before=["humanreview"]
+    )
+```
+
+---
+
+## 🌊 STEP 6: STREAMING (Next.js UI)
+
+```python
+async def runaipipeline(...):
+    graph = buildgraph(session)
+
+    config = {
+        "configurable": {
+            "thread_id": str(conversation.id)
+        }
+    }
+
+    async for event in graph.astream_events(initial_state, config, version="v2"):
+        if event["event"] == "on_chat_model_stream":
+            chunk = event["data"]["chunk"]
+            if chunk.content:
+                yield chunk.content
+
+    final_state = await graph.aget_state(config)
+
+    return final_state
+```
+
+---
+
+## 🧠 STEP 7: DB SYNC (KEEP + EXTEND)
+
+Inside `node_update_status`:
+
+```python
+state_ai = {
+    "proposed_stage": state.get("classification").newpipelinestage,
+    "lead_score": state.get("classification").leadscore,
+    "tools_used": state.get("tools_used", [])
+}
+
+contact.external_ids["ai_state"] = state_ai
+```
+
+---
+
+## 🎯 SUCCESS CRITERIA
+
+System must:
+
+✔ Route dynamically between agents
+✔ Use tools (RAG, estimation, Calendly)
+✔ Maintain DB integrity
+✔ Stream responses
+✔ Push toward booking (sales-first)
+
+---
+
+## 🧪 TEST INPUT
+
+```
+"Renovation project around $50k, timeline?"
+```
+
+Expected flow:
+
+classify → estimator → tool → drafter → Calendly CTA
+
+---
+
+## 🔥 BONUS LOGGING
+
+Add logs:
+
+```
+"Routed to estimator"
+"Estimator tool called"
+"Calendly link generated"
+```
+
+---
+
+## 🧠 FINAL GOAL
+
+This is NOT a chatbot.
+
+This is a **sales execution system**:
+
+* Qualifies leads
+* Estimates projects
+* Closes with booking
+
+---

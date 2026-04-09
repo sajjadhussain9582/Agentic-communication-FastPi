@@ -49,13 +49,13 @@ def should_include_cta(
     score = float(cta_readiness_score or 0)
     missing = [m for m in (missing_fields or []) if str(m).strip()]
 
-    if stage in ("proposal_ready", "meeting_booked", "qualified", "negotiation", "won"):
+    if stage in ("meeting_booked", "proposal_ready", "negotiation", "won"):
         return True
     if turn <= 1:
         return True
     if score >= 80:
         return True
-    if stage in ("requirements_gathering", "discovery") and len(missing) >= 3 and score < 60:
+    if stage in ("discovery",) and len(missing) >= 3 and score < 60:
         return False
     if score < 30 and len(missing) >= 2:
         return False
@@ -103,27 +103,27 @@ def setup_checkpointer():
 
 class MessageClassification(BaseModel):
     """Structured output from the classification node."""
-    role_type: str = Field(description="one of: contractor, agent, developer, architect, builder, unknown")
-    intent_type: str = Field(description="one of: service_inquiry, pricing_request, booking_request, partnership_inquiry, support_request, follow_up, complaint, nurture")
-    relationship_type: str = Field(description="one of: inbound_lead, outbound_prospect, referral_partner, existing_client, dormant_lead, reengaged_lead")
-    decision_role: str = Field(description="one of: decision_maker, influencer, researcher, assistant, unknown")
+    role_type: str = Field(description="one of: buyer, seller, unknown")
+    intent_type: str = Field(description="one of: property_search, property_listing, pricing_request, visit_request, follow_up, support_request, irrelevant")
+    relationship_type: str = Field(description="one of: inbound_lead, existing_client, referral, unknown")
+    decision_role: str = Field(description="one of: decision_maker, influencer, researcher, unknown")
     engagement_temperature: str = Field(description="one of: cold, warm, hot")
     qualification_stage: str = Field(description="one of: discovery, qualified, not_qualified, needs_info")
     is_escalated: bool = Field(description="True if human intervention is explicitly needed")
     conversation_status: str = Field(description="one of: open, pending_human, closed")
     lead_score: float | None = Field(description="number 0-100 or null if unknown")
-    is_qualified: bool | None = Field(description="true if serious client, false if obviously unrelated/spam, null otherwise")
+    is_qualified: bool | None = Field(description="true if serious client, false if out of scope, null otherwise")
     budget: str | None = Field(description="budget signal from user")
-    project_type: str | None = Field(description="project type signal from user")
-    timeline: str | None = Field(description="timeline signal from user")
-    project_scope: str | None = Field(description="scope details from user")
+    project_type: str | None = Field(description="property type: house, apartment, plot, commercial")
+    timeline: str | None = Field(description="urgency signal from user")
+    project_scope: str | None = Field(description="property details like size, bedrooms")
     decision_authority: str | None = Field(description="who makes decisions")
-    geography: str | None = Field(description="location of project")
-    new_pipeline_stage: str = Field(description="The stage the AI decides to move them to (discovery, qualified, proposal_ready, etc.)")
+    geography: str | None = Field(description="area in Lahore")
+    new_pipeline_stage: str = Field(description="The stage: discovery, qualified, meeting_booked, proposal_ready, negotiation, won, lost")
     close_readiness_score: float = Field(description="number 0-100")
-    requires_action: list[str] = Field(description="List of actions: 'update_status', 'send_calendly', 'send_proposal'")
-    missing_qualification_fields: list[str] = Field(description="Fields still needed: scope, budget, timeline, location, stakeholders")
-    filled_fields: list[str] = Field(default_factory=list, description="Fields already filled: project_type, scope, budget_signal, timeline_signal, location, stakeholders, must_have_features")
+    requires_action: list[str] = Field(description="List of actions: 'update_status', 'share_listings', 'schedule_visit', 'escalate_pricing'")
+    missing_qualification_fields: list[str] = Field(description="Fields still needed: location, property_type, budget, bedrooms, purpose")
+    filled_fields: list[str] = Field(default_factory=list, description="Fields already filled: location, property_type, budget, bedrooms, purpose, size, preferred_area")
     next_best_questions: list[str] = Field(description="1-3 short questions to ask next")
 
 class AgentState(TypedDict, total=False):
@@ -150,211 +150,233 @@ class AgentState(TypedDict, total=False):
     error: str
 
 PERSONA_POLICIES: dict[str, dict[str, str]] = {
-   "contractor": {
-        "focus": "identify if they need execution support or are open to partnership for handling overflow or specialized work",
-        "value": "we help contractors deliver projects faster by handling design, planning, and execution through our in-house team",
-        "questions": "are you looking for project support or additional leads, what type of projects do you handle, what challenges are you facing currently",
-        "cta": "If they need support, move toward consultation; if partnership fit, propose a partnership alignment call",
+    "buyer": {
+        "focus": "understand exact property requirements and move toward showing options",
+        "value": "we help you find the best property based on your needs and budget",
+        "questions": "preferred area, budget range, rent or buy, number of bedrooms, any specific requirements",
+        "cta": "once requirements are clear, offer property options or schedule a visit",
     },
 
-    "agent": {
-        "focus": "determine if they are a referral partner or have clients needing design/build services",
-        "value": "we help agents close more deals by supporting their clients with end-to-end project execution",
-        "questions": "do your clients require design or construction services, what markets do you serve, how often do you get such requirements",
-        "cta": "If referral potential exists, propose partnership call; if direct project, move toward consultation",
-    },
-
-    "developer": {
-    "focus": "determine if they are a serious property / real-estate developer or long-term build partner; assess project scope, stakeholders, and delivery expectations",
-    "questions": "project type (residential/commercial), phases, stakeholders involved, budget range, deployment timeline, decision authority",
-    "cta": "If qualified, propose a discovery/consultation call about their real-estate or construction projects; if early-stage, continue structured qualification before          booking.",
-    },
-
-    "architect": {
-        "focus": "identify if they need execution support or collaboration for delivering projects",
-        "value": "we support architects by executing their designs and handling project delivery end-to-end",
-        "questions": "are you looking for execution support, what stage is your project in, who is the end client, timeline and budget clarity",
-        "cta": "If collaboration fit, propose partnership discussion; if direct project, guide to consultation",
-    },
-
-    "builder": {
-        "focus": "assess if they need operational support or collaboration for project delivery",
-        "value": "we help builders streamline delivery by handling planning, design coordination, and execution support",
-        "questions": "what type of builds do you handle, current bottlenecks, project volume, timeline and budget signals",
-        "cta": "If high intent, move toward consultation or partnership kickoff depending on context",
+    "seller": {
+        "focus": "understand property details and help list or market it",
+        "value": "we connect you with serious buyers or tenants quickly",
+        "questions": "property type, location, demand/price expectation, condition, urgency",
+        "cta": "collect details and move toward listing or discussing potential buyers",
     },
 
     "unknown": {
-        "focus": "identify role, intent, and seriousness quickly without making assumptions",
-        "value": "we support real-estate and construction stakeholders with architecture, planning, and execution",
-        "questions": "what type of property/construction project you need support with, your role, budget, timeline, and decision authority",
-        "cta": "If in-scope and clear, guide to consultation; otherwise request clarification politely",
+        "focus": "quickly identify whether they are buyer or seller",
+        "value": "we assist with buying, selling, and renting properties in Lahore",
+        "questions": "are you looking to buy, sell, or rent a property?",
+        "cta": "once intent is clear, shift to buyer or seller flow",
     },
 }
 
-DECISION_PROMPT = """You are an AI Sales Manager for a B2B services company of real estate (• Contractors
-• Real estate agents
-• Real estate developersz
-• architects
-• home builders)
+DECISION_PROMPT = """You are a Property Dealer .
 
-Your responsibility is to:
-- qualify leads accurately
-- determine the safest valid pipeline stage
-- identify blockers preventing progression
-- decide the next best action to move the deal forward
-- avoid premature stage advancement
+BUSINESS SCOPE (STRICT):
 
-You MUST output ONLY valid JSON with the following keys:
+You ONLY handle:
+- Buying properties
+- Selling properties
+- Renting properties
 
-- role_type: one of: contractor, agent, developer, architect, builder, unknown
-- intent_type: one of: service_inquiry, pricing_request, booking_request, partnership_inquiry, support_request, follow_up, complaint, nurture
-- relationship_type: one of: inbound_lead, outbound_prospect, referral_partner, existing_client, dormant_lead, reengaged_lead
-- decision_role: one of: decision_maker, influencer, researcher, assistant, unknown
-- engagement_temperature: one of: cold, warm, hot
-- qualification_stage: one of: discovery, qualified, not_qualified, needs_info
-- is_escalated: true or false
-- conversation_status: one of: open, pending_human, closed
-- lead_score: number between 0-100 or null
-- is_qualified: true, false, or null
-- budget: string or null
-- project_type: string or null
-- timeline: string or null
-- project_scope: string or null
-- decision_authority: string or null
-- geography: string or null
-- new_pipeline_stage: one of: discovery, qualified, meeting_booked, proposal_ready, negotiation, won, lost
-- close_readiness_score: number between 0-100
-- requires_action: array of actions from: update_status, send_calendly, send_proposal
-- missing_qualification_fields: array from: scope, budget, timeline, location, stakeholders, constraints
-- filled_fields: array from: project_type, scope, budget_signal, timeline_signal, location, stakeholders, must_have_features
-- next_best_questions: array of 1-3 short questions
+Property types:
+- Houses
+- Apartments / Flats
+- Plots
+- Commercial properties
 
------------------------------
-STAGE EVIDENCE RULES (STRICT)
------------------------------
+LOCATION:
+- ONLY Lahore and nearby areas
 
-You MUST follow these rules when setting new_pipeline_stage:
+YOU DO NOT HANDLE:
+- Construction
+- Renovation
+- Architecture
+- Interior design
+- Partnerships
+- Software / websites / any other services
+
+--------------------------------------------------
+
+YOUR ROLE:
+
+You act like a smart property agent.
+
+Your job is to:
+- Understand client requirements
+- Extract key details:
+  - location
+  - property type
+  - budget
+  - bedrooms / size
+  - purpose (rent / buy / sell)
+- Help them find suitable options
+- Move them toward property viewing or deal closure
+
+--------------------------------------------------
+
+CLASSIFICATION LOGIC:
+
+role_type:
+- buyer
+- seller
+- unknown
+
+intent_type:
+- property_search → buyer intent (looking to buy/rent)
+- property_listing → seller intent (wants to sell/rent out)
+- pricing_request → asking about price
+- visit_request → wants to view property
+- follow_up
+- support_request
+- irrelevant
+
+relationship_type:
+- inbound_lead
+- existing_client
+- referral
+- unknown
+
+qualification_stage:
+- discovery → missing key details
+- qualified → location + type + budget clear
+- meeting_booked → qualified AND user shows intent (wants to visit, see options, schedule)
+- proposal_ready → scope clearly defined AND user wants to proceed
+- negotiation → pricing/terms discussion started
+- won → explicit acceptance/deal confirmed
+- lost → explicit rejection OR clearly irrelevant/out of Lahore
+
+--------------------------------------------------
+
+IMPORTANT RULES:
+
+- ALWAYS extract location (even if partial like "DHA", "Bahria")
+- NEVER say "we don't operate there" without checking if it's Lahore area
+- If location unclear → ASK for clarification
+- If user gives requirements → move toward sharing options
+- DO NOT ask irrelevant business questions (like stakeholders, scope, etc.)
+
+--------------------------------------------------
+
+SMART BEHAVIOR:
+
+If user says:
+"I want 4-5 bedroom house in Lahore"
+
+You SHOULD:
+- assume they mean 4-5 bedroom house
+- ask:
+  - preferred area?
+  - budget range?
+  - rent or buy?
+
+NOT:
+- reject
+- misinterpret
+
+--------------------------------------------------
+
+STAGE EVIDENCE RULES (STRICT):
 
 - discovery:
-  default when key qualification data is missing
+  default when key details are missing (location, type, budget, purpose)
 
 - qualified:
-  ONLY if ALL are present:
-  - project_type
-  - budget or budget_signal
-  - timeline or timeline_signal
+  ONLY if location + property type + budget are clear
 
 - meeting_booked:
-  ONLY if:
-  - qualified conditions are met
-  AND
-  - user shows intent (asks next steps, pricing, availability, or moving forward)
+  ONLY if qualified AND user shows intent to see options or visit
 
 - proposal_ready:
-  ONLY if:
-  - scope is clearly defined
-  AND
-  - decision authority or stakeholders are identified
-  AND
-  - user shows execution intent
+  ONLY if scope clearly defined AND user wants to proceed
 
 - negotiation:
-  ONLY if:
-  - pricing or terms discussion has started
-  OR
-  - user is comparing options
+  ONLY if pricing/terms discussion has started
 
 - won:
-  ONLY if:
-  - explicit acceptance or commitment is present
+  ONLY if explicit acceptance or deal confirmed
 
 - lost:
-  ONLY if:
-  - explicit rejection OR clearly irrelevant/spam
+  ONLY if clearly out of scope (not Lahore, irrelevant request) or explicit rejection
 
 IMPORTANT:
 - DO NOT skip stages
 - DO NOT assume missing data
 - If required fields are missing → stay in earlier stage
-- It is better to stay one stage behind than move too early
 
---------------------------------
-MISSING FIELD HARD CONSTRAINTS
---------------------------------
+--------------------------------------------------
 
-- If budget OR timeline is missing → MUST NOT exceed "discovery"
-- If scope is missing → MUST NOT exceed "qualified"
-- If stakeholders/decision authority missing → MUST NOT exceed "meeting_booked"
+LEAD SCORING RULES (0-100):
 
---------------------------------
-LEAD SCORING RULES (0–100)
---------------------------------
-
-Assign lead_score based on:
-
-- +25 → clear project_type
+- +25 → clear property type
 - +25 → budget mentioned
-- +20 → timeline mentioned
-- +15 → urgency (ASAP, soon, active project)
-- +15 → decision authority identified
+- +20 → location specified
+- +15 → urgency (ASAP, soon, actively looking)
+- +15 → purpose clear (buy/sell/rent)
 
-Score interpretation:
-- 0–40 → cold
-- 41–70 → warm
-- 71–100 → hot
+--------------------------------------------------
 
---------------------------------
-ACTION RULES
---------------------------------
+PRICING / BUDGET ESCALATION (CRITICAL):
 
-- include "send_calendly" ONLY if:
-  - stage is "qualified" or higher
-  AND
-  - engagement_temperature is "warm" or "hot"
+If the user asks about:
+- price
+- budget
+- cost
+- estimated budget
+- how much
+- rate
+- market value
+- property value
+- any pricing related question
 
-- include "send_proposal" ONLY if:
-  - stage is "proposal_ready" or higher
+You MUST:
+- Set is_escalated = true
+- Set conversation_status = "pending_human"
+- Set requires_action = ["escalate_pricing"]
+- Do NOT attempt to answer pricing questions
+- Do NOT give rough estimates
+- Do NOT guess market rates
 
-- include "update_status" ONLY if:
-  - new_pipeline_stage differs from current logical stage
+The human team will respond manually with accurate pricing.
 
---------------------------------
-DECISION THINKING
---------------------------------
+--------------------------------------------------
 
-At every step determine:
+OUTPUT JSON with these keys:
 
-1. Is this a real opportunity?
-2. What information is missing?
-3. What is blocking progress?
-4. What is the safest next step?
+- role_type: one of: buyer, seller, unknown
+- intent_type: one of: property_search, property_listing, pricing_request, visit_request, follow_up, support_request, irrelevant
+- relationship_type: one of: inbound_lead, existing_client, referral, unknown
+- decision_role: one of: decision_maker, influencer, researcher, unknown
+- engagement_temperature: one of: cold, warm, hot
+- qualification_stage: one of: discovery, qualified, not_qualified, needs_info
+- is_escalated: true or false
+- conversation_status: one of: open, pending_human, closed
+- lead_score: number 0-100 or null
+- is_qualified: true, false, or null
+- budget: string or null
+- project_type: string or null (property type)
+- timeline: string or null (urgency)
+- project_scope: string or null (property details/size)
+- decision_authority: string or null
+- geography: string or null (area in Lahore)
+- new_pipeline_stage: one of: discovery, qualified, meeting_booked, proposal_ready, negotiation, won, lost
+- close_readiness_score: number 0-100
+- requires_action: array of actions from: update_status, share_listings, schedule_visit, escalate_pricing
+- missing_qualification_fields: array from: location, property_type, budget, bedrooms, purpose
+- filled_fields: array from: location, property_type, budget, bedrooms, purpose, size, preferred_area
+- next_best_questions: array of 1-3 short questions
 
---------------------------------
-GENERAL RULES
---------------------------------
-
-- Keep outputs factual and concise
-- Do NOT hallucinate missing data
-- If uncertain → return null and include in missing_qualification_fields
-- Prefer safe progression over aggressive advancement
-- Do not include any keys outside the schema
-
---------------------------------
-OUT-OF-DOMAIN GUARDRAIL (SOFTWARE/WEB)
---------------------------------
-
-- This system serves ONLY the real estate / construction ecosystem:
-  contractors, real-estate agents, real-estate developers, architects, home builders.
-- If the message is clearly about websites, web apps, SaaS platforms, or generic IT/software development,
-  then treat it as OUT OF SCOPE:
-  - Set role_type = "unknown".
-  - Set is_qualified = false.
-  - Prefer qualification_stage = "not_qualified".
-  - Prefer new_pipeline_stage = "lost" or stay at "discovery".
-  - In requires_action, DO NOT include send_calendly or send_proposal.
-
---------------------------------
+CRITICAL TYPE RULES:
+- is_escalated MUST be a JSON boolean: true or false (NOT a string)
+- is_qualified MUST be a JSON boolean or null (NOT a string)
+- lead_score MUST be a JSON number or null (NOT a string like "null" or "0")
+- close_readiness_score MUST be a JSON number (NOT a string)
+- requires_action MUST be a JSON array (NOT a string, NOT null — use empty array [] if none)
+- missing_qualification_fields MUST be a JSON array
+- filled_fields MUST be a JSON array
+- next_best_questions MUST be a JSON array
 
 Form/channel context:
 {json_snapshot}
@@ -366,142 +388,93 @@ Knowledge base excerpts:
 {rag_context}
 """
 
-REPLY_PROMPT = """You are an AI Sales Manager executing the next best sales action.
+REPLY_PROMPT = """You are a professional property dealer/agent.
 
-Your job is to:
-- qualify efficiently
-- build trust quickly
-- reduce friction
-- move the deal forward toward consultation, proposal, or close
-
-Write ONE clear, professional, human-like reply.
+Your replies should:
+1. Acknowledge request
+2. Show understanding
+3. Ask 1-2 relevant questions OR suggest next step
+4. Move toward:
+   - sharing listings
+   - scheduling meeting
 
 --------------------------------
-CORE RULES
+RULES:
 --------------------------------
 
+- Be natural and helpful
+- DO NOT sound like a corporate sales bot
+- DO NOT ask irrelevant questions (like stakeholders, scope, software-style questions)
+- DO NOT reject valid property queries
 - NEVER use placeholders like "[Name]", "[Your Name]", "[City]"
 - Use provided names; if missing, use "Hi," or "Hi there,"
-- Be concise, executive, and natural
-- Do NOT repeat questions already answered
-- Do NOT ask more than 1–2 questions
-- Do NOT overwhelm the user
+- Be concise and conversational
+- NEVER give price estimates, rough budgets, or market rate guesses
+- If user asks about pricing/budget/cost → DO NOT answer
+- Pricing queries are handled by the human team only
 
 --------------------------------
-OUT-OF-SCOPE HANDLING (CRITICAL)
---------------------------------
-
-- This assistant ONLY supports real-estate / construction domain.
-- If user asks for website, app, software, SaaS, IT development, or unrelated digital-product services:
-  - clearly state this is outside service scope
-  - do NOT ask website/app follow-up discovery questions
-  - do NOT claim capability to deliver such digital services
-  - offer help only for in-scope real-estate/construction services
-
---------------------------------
-KNOWLEDGE & ACCURACY
---------------------------------
-
-- ONLY use facts from knowledge excerpts below
-- If info is missing → acknowledge and ask a targeted question
-- If retrieval confidence is low → suggest consultation instead of guessing
-- DO NOT hallucinate pricing, policies, or guarantees
-
---------------------------------
-BUSINESS POSITIONING
---------------------------------
-
-- Position the company as a full-service provider:
-  architecture, planning, budgeting, and execution
-- Emphasize integrated in-house delivery
-- Do NOT talk about internal systems/tools
-
---------------------------------
-SALES EXECUTION STRUCTURE
---------------------------------
-
-Every reply should follow:
-
-1. Acknowledge context (short)
-2. Provide value or clarity
-3. Move the deal forward:
-   - ask 1–2 key questions OR
-   - provide CTA OR
-   - guide next step
-
---------------------------------
-STAGE-BASED BEHAVIOR (CRITICAL)
+STAGE-BASED BEHAVIOR
 --------------------------------
 
 Current stage: {stage_key}
 
 - discovery:
-  - ask 1–2 qualification questions
-  - DO NOT provide booking link
-  - focus on missing_fields
+  - ask 1-2 property qualification questions
+  - focus on: location, type, budget, purpose
+  - DO NOT provide listings yet
 
 - qualified:
-  - confirm understanding
-  - if user shows intent → include booking link
-  - otherwise soft CTA or continue qualification
+  - confirm understanding of requirements
+  - offer to share matching options
+  - if user shows intent → suggest visit/meeting
 
 - meeting_booked:
-  - provide booking link directly
+  - share available options or schedule meeting
   - minimize additional questions
 
 - proposal_ready:
-  - confirm scope or stakeholders if needed
-  - move toward proposal or decision
-  - DO NOT restart discovery
+  - present specific proposals or options
+  - move toward closing
 
 - negotiation:
-  - address pricing, objections, or terms
-  - push toward decision
-  - avoid new qualification
+  - address pricing, terms
+  - push toward deal closure
 
 - won:
-  - confirm next steps / onboarding tone
+  - confirm next steps / handover
 
 - lost:
-  - close politely
+  - politely explain we only handle Lahore area property deals
   - do NOT re-engage qualification
 
 --------------------------------
 CTA RULES
 --------------------------------
 
-- ONLY include booking link if:
-  - stage is meeting_booked or higher
-  OR
-  - user explicitly asks for meeting/link
-
-- NEVER include booking link in discovery
-
-- If booking link is included:
-  - use best match from available links
-  - fallback to default: {booking_url}
+- ONLY suggest property visit if stage is meeting_booked or higher
+- ONLY share listings if stage is qualified or higher
+- In discovery → focus on gathering requirements
 
 Available booking links:
 {booking_links_context}
 
---------------------------------
-QUESTION STRATEGY
---------------------------------
-
-- Ask only from missing_fields / next_best_questions
-- PRIORITY:
-  1. budget
-  2. timeline
-  3. scope
-  4. stakeholders
+Default booking URL: {booking_url}
 
 --------------------------------
-MOMENTUM RULE
+GOOD EXAMPLE:
 --------------------------------
 
-- If user shows strong intent → act immediately
-- Do NOT delay next step unnecessarily
-- Do NOT over-qualify a ready buyer
+User: "Looking for 4-5 bedroom house in Lahore"
+
+Reply:
+"Got it — you're looking for a 4-5 bedroom house in Lahore.
+
+Could you share:
+- preferred area (DHA, Bahria, etc.)?
+- budget range?
+
+I can shortlist some good options for you right away."
 
 --------------------------------
 PERSONA GUIDANCE
@@ -524,7 +497,6 @@ CONTEXT
 - Recent context: {recent_context}
 - Missing fields: {missing_fields}
 - Filled fields: {filled_fields}
-- Estimator guidance: {estimator_context}
 - CTA policy: {cta_policy}
 
 --------------------------------
@@ -546,7 +518,7 @@ USER MESSAGE
 {user_text}
 """
 
-ESCALATION_BRIEF_PROMPT = """You are an AI Sales Analyst. Your goal is to summarize the entire conversation and extracted data into a clear, actionable brief that helps a human quickly understand the context of a lead escalation.
+ESCALATION_BRIEF_PROMPT = """You are an AI Property Analyst. Your goal is to summarize the entire conversation and extracted data into a clear, actionable brief that helps a human agent quickly understand the context of a lead escalation.
 
 Your output MUST follow this EXACT format and use the provided data. If any field is unknown, write "Not specified". Do NOT include placeholders.
 
@@ -554,19 +526,19 @@ Your output MUST follow this EXACT format and use the provided data. If any fiel
 
 Lead Summary:
 - Name: {contact_name}
-- Role / Persona: {role_type}
+- Role: {role_type}
 - Relationship Type: {relationship_type}
 - Decision Role: {decision_role}
 - Engagement Level: {engagement_temperature}
 
 ---
 
-Project / Requirement:
-- Project Type: {project_type}
-- Scope: {project_scope}
+Property Requirement:
+- Property Type: {project_type}
+- Details/Size: {project_scope}
 - Budget: {budget}
-- Timeline: {timeline}
-- Location: {geography}
+- Urgency: {timeline}
+- Location/Area: {geography}
 
 ---
 
@@ -579,7 +551,7 @@ Qualification Status:
 ---
 
 Key Signals:
-- Buying Intent: {buying_intent_summary}
+- Buying/Selling Intent: {buying_intent_summary}
 - Urgency Level: {urgency_level}
 - Constraints or Risks: {constraints_risks}
 
@@ -611,13 +583,13 @@ User Message: {user_text}
 -----------------------------
 
 Instructions for fields:
-- Buying Intent: summarize briefly based on user language (1-2 lines)
+- Buying/Selling Intent: summarize briefly based on user language (1-2 lines)
 - Urgency Level: low / medium / high (based on timeline and language)
 - Constraints or Risks: mention missing info, unclear budget, or hesitation signals
-- Conversation Highlights: 3-5 bullet points focusing on decisions, preferences, and important statements. Avoid generic phrases.
-- Missing Information: Bulleted list of critical missing fields.
-- Recommended Next Action: Suggest ONE clear action (e.g., book consultation, send proposal, continue qualification, escalate to senior team).
-- AI Notes (Internal): Mention why escalation happened and any inconsistencies/risks.
+- Conversation Highlights: 3-5 bullet points focusing on property preferences, decisions, and important statements
+- Missing Information: Bulleted list of critical missing fields
+- Recommended Next Action: Suggest ONE clear action (e.g., share listings, schedule property visit, continue qualification, escalate to senior agent)
+- AI Notes (Internal): Mention why escalation happened and any inconsistencies/risks
 """
 def _safe_list(value: Any) -> list[str]:
     if isinstance(value, list):
@@ -649,47 +621,37 @@ def _extract_slot_state(user_text: str, contact: Contact) -> dict[str, Any]:
     if isinstance(prev_slots, dict):
         slots.update(prev_slots)
 
-    if contact.project_type and "project_type" not in slots:
-        slots["project_type"] = contact.project_type
-    if contact.budget and "budget_signal" not in slots:
-        slots["budget_signal"] = contact.budget
-    if contact.timeline and "timeline_signal" not in slots:
-        slots["timeline_signal"] = contact.timeline
+    if contact.project_type and "property_type" not in slots:
+        slots["property_type"] = contact.project_type
+    if contact.budget and "budget" not in slots:
+        slots["budget"] = contact.budget
+    if contact.timeline and "urgency" not in slots:
+        slots["urgency"] = contact.timeline
 
-    # Treat only real-estate / construction terms as valid project_type triggers.
-    # Explicitly exclude generic software/web dev terms from domain.
-    if re.search(r"\b(house|home|apartment|flat|villa|plot|residential|commercial|building|construction|renovation|remodel)\b", text):
-        slots["project_type"] = user_text[:120]
-    if re.search(r"\b(\$|usd|budget|k\b|million|m\b)\b", text):
-        slots["budget_signal"] = user_text[:120]
-    if re.search(r"\b(week|weeks|month|months|quarter|timeline|deadline|asap)\b", text):
-        slots["timeline_signal"] = user_text[:120]
-    if re.search(r"\b(in|at)\s+[a-zA-Z][a-zA-Z\s]{2,30}\b", text):
-        slots.setdefault("location", user_text[:120])
-    if re.search(r"\b(founder|owner|decision|stakeholder|partner|team)\b", text):
-        slots["stakeholders"] = user_text[:120]
-    if re.search(r"\b(must|need|require|important|feature|integration)\b", text):
-        slots["must_have_features"] = user_text[:200]
-    if re.search(r"\b(scope|full build|mvp|revamp|redesign)\b", text):
-        slots["scope"] = user_text[:200]
+    # Property type detection
+    if re.search(r"\b(house|home|apartment|flat|villa|plot|commercial|shop|office|plaza|penthouse|farmhouse|bungalow|marla|kanal)\b", text):
+        slots["property_type"] = user_text[:120]
+    # Budget detection
+    if re.search(r"\b(\$|pkr|rs|lac|lakh|crore|cr|budget|million|m\b|k\b)\b", text):
+        slots["budget"] = user_text[:120]
+    # Location / area detection (Lahore areas)
+    if re.search(r"\b(dha|bahria|johar town|model town|gulberg|cantt|wapda town|valencia|askari|lake city|garden town|iqbal town|township|defence|raiwind|bedian|canal|mall road|lahore)\b", text):
+        slots["location"] = user_text[:120]
+    # Purpose detection
+    if re.search(r"\b(buy|purchase|rent|lease|sell|selling|sale)\b", text):
+        slots["purpose"] = user_text[:120]
+    # Bedrooms detection
+    if re.search(r"\b(\d+)\s*(bed|bedroom|br|room)\b", text):
+        slots["bedrooms"] = user_text[:120]
+    # Size detection
+    if re.search(r"\b(\d+)\s*(marla|kanal|sq\s*ft|sqft|square\s*feet|yard)\b", text):
+        slots["size"] = user_text[:120]
     return slots
 
 
 def _wants_estimate(user_text: str) -> bool:
-    text = (user_text or "").lower()
-    return any(
-        token in text
-        for token in (
-            "budget",
-            "cost",
-            "price",
-            "pricing",
-            "how much",
-            "estimate",
-            "timeline",
-            "how long",
-        )
-    )
+    # Pricing queries are always escalated to human — never auto-estimate
+    return False
 
 
 def _format_estimator_context(user_text: str, slots: dict[str, Any]) -> str:
@@ -734,6 +696,15 @@ def build_graph(session: Session):
 
         try:
             classification = structured_llm.invoke([HumanMessage(content=prompt)])
+            # Force escalation for any pricing/budget query
+            user_lower = state.get("user_text", "").lower()
+            pricing_keywords = ["price", "budget", "cost", "how much", "rate", "estimate", "worth", "value", "kitna", "kya rate", "kitnay", "kitne"]
+            is_pricing_query = any(kw in user_lower for kw in pricing_keywords) or (classification.intent_type == "pricing_request")
+            if is_pricing_query:
+                classification.is_escalated = True
+                classification.conversation_status = "pending_human"
+                classification.requires_action = ["escalate_pricing"]
+                return Command(update={"classification": classification}, goto="human_review")
             if classification.is_escalated:
                 return Command(update={"classification": classification}, goto="human_review")
             elif "update_status" in (classification.requires_action or []):
@@ -742,7 +713,32 @@ def build_graph(session: Session):
                 return Command(update={"classification": classification}, goto="retrieve")
         except Exception as e:
             logger.error(f"Classification error: {e}")
-            return Command(goto="retrieve")
+            # Provide a safe fallback classification
+            fallback = MessageClassification(
+                role_type="unknown",
+                intent_type="follow_up",
+                relationship_type="inbound_lead",
+                decision_role="unknown",
+                engagement_temperature="cold",
+                qualification_stage="discovery",
+                is_escalated=False,
+                conversation_status="open",
+                lead_score=None,
+                is_qualified=None,
+                budget=None,
+                project_type=None,
+                timeline=None,
+                project_scope=None,
+                decision_authority=None,
+                geography=None,
+                new_pipeline_stage="discovery",
+                close_readiness_score=0.0,
+                requires_action=[],
+                missing_qualification_fields=["location", "property_type", "budget", "bedrooms", "purpose"],
+                filled_fields=[],
+                next_best_questions=["What type of property are you looking for?", "Which area in Lahore do you prefer?"],
+            )
+            return Command(update={"classification": fallback}, goto="retrieve")
 
     def node_retrieve(state: AgentState) -> Command:
         q = state.get("user_text", "")[:8000]
@@ -826,9 +822,9 @@ def build_graph(session: Session):
         prompt = REPLY_PROMPT.format(
             channel=state.get("channel", "website"),
             contact_name=state.get("contact_name", "there"),
-            agent_name=state.get("agent_name", "StrategistHub"),
+            agent_name=state.get("agent_name", "PropertyHub"),
             stage_key=stage_key,
-            relationship_type="inbound_lead", # Default
+            relationship_type="inbound_lead",
             engagement_temperature="warm",
             decision_role="decision_maker",
             rag_context=state.get("rag_context", ""),
@@ -836,14 +832,12 @@ def build_graph(session: Session):
             user_text=state.get("user_text", ""),
             booking_url=state.get("booking_url", ""),
             booking_links_context=booking_links_context,
-            persona_segment=persona_segment,
             role_type=persona_segment,
             persona_policy=json.dumps(persona_policy),
             conversation_turn=state.get("conversation_turn", 1),
             recent_context=state.get("recent_context", ""),
             missing_fields=", ".join(classification.missing_qualification_fields) if classification else "",
             filled_fields=state.get("filled_fields", ""),
-            estimator_context=state.get("estimator_context", ""),
             cta_policy=stage_instruction,
         )
         
@@ -925,6 +919,72 @@ def build_graph(session: Session):
                     session.add(system_msg)
                     session.commit()
                     logger.info(f"Escalated conversation {conversation_id} and saved brief.")
+                    
+                    # Send email notification for escalation
+                    try:
+                        from app.services.email_service import send_email
+                        email_subject = f"Lead Escalation - {state.get('contact_name', 'Unknown')}"
+                        email_body = f"""
+A lead has been escalated and requires manual response.
+
+Contact: {state.get('contact_name', 'Unknown')}
+Channel: {state.get('channel', 'Unknown')}
+Conversation ID: {conversation_id}
+
+Reason: {'Pricing/budget inquiry - DO NOT auto-respond' if 'escalate_pricing' in (classification.requires_action or []) else 'AI flagged for human review'}
+
+--- Escalation Brief ---
+{conv.escalation_brief}
+
+--- Latest Message ---
+{state.get('user_text', '')}
+"""
+                        import asyncio
+                        if asyncio.iscoroutinefunction(send_email):
+                            # If send_email is async, we need to run it - but since node_human_review is sync,
+                            # we'll create a task and log any errors
+                            async def _send():
+                                try:
+                                    # Get email config from settings
+                                    from app.core.config import settings
+                                    email_config = {
+                                        "type": getattr(settings, "EMAIL_PROVIDER", "smtp"),
+                                        "host": getattr(settings, "SMTP_HOST", ""),
+                                        "port": getattr(settings, "SMTP_PORT", 587),
+                                        "user": getattr(settings, "SMTP_USER", ""),
+                                        "password": getattr(settings, "SMTP_PASSWORD", ""),
+                                        "from_email": getattr(settings, "FROM_EMAIL", "noreply@strategisthub.com"),
+                                        "use_tls": getattr(settings, "SMTP_USE_TLS", True),
+                                    }
+                                    await send_email(email_config, "sajjad_hussain@strategisthub.com", email_subject, email_body)
+                                    logger.info(f"Escalation email sent for conversation {conversation_id}")
+                                except Exception as email_err:
+                                    logger.warning(f"Could not send escalation email: {email_err}")
+                            # Schedule the async task
+                            try:
+                                loop = asyncio.get_event_loop()
+                                if loop.is_running():
+                                    loop.create_task(_send())
+                                else:
+                                    loop.run_until_complete(_send())
+                            except Exception as loop_err:
+                                logger.warning(f"Could not schedule escalation email: {loop_err}")
+                        else:
+                            # Synchronous call
+                            from app.core.config import settings
+                            email_config = {
+                                "type": getattr(settings, "EMAIL_PROVIDER", "smtp"),
+                                "host": getattr(settings, "SMTP_HOST", ""),
+                                "port": getattr(settings, "SMTP_PORT", 587),
+                                "user": getattr(settings, "SMTP_USER", ""),
+                                "password": getattr(settings, "SMTP_PASSWORD", ""),
+                                "from_email": getattr(settings, "FROM_EMAIL", "noreply@strategisthub.com"),
+                                "use_tls": getattr(settings, "SMTP_USE_TLS", True),
+                            }
+                            send_email(email_config, "sajjad_hussain@strategisthub.com", email_subject, email_body)
+                            logger.info(f"Escalation email sent for conversation {conversation_id}")
+                    except Exception as email_err:
+                        logger.warning(f"Could not send escalation email: {email_err}")
             except Exception:
                 logger.exception("Error in node_human_review while generating brief")
         
@@ -962,7 +1022,7 @@ async def run_ai_pipeline(
     # Check for keywords to assume defaults and provide plan
     keywords = ["immediately", "proceed", "yes"]
     if any(kw in user_text.lower() for kw in keywords):
-        user_text += " Assume defaults: project type is double-storey, timeline is ASAP. Provide a detailed plan instead of asking more questions. Use new KB entries for guidance."
+        user_text += " Assume the client is ready to proceed. Share available property options or suggest a visit."
         # Clear recent context to avoid looping
         recent_context = ""
     else:
@@ -1096,24 +1156,44 @@ async def run_ai_pipeline(
     session.add(contact)
 
     kb_ids = final.get("rag_kb_ids") or []
-    outbound = Message(
-        conversation_id=conversation.id,
-        conversation_public_uuid=conversation.public_uuid,
-        sender_type="agent",
-        sender_id=None,
-        message_type="text",
-        message=(
-            final.get("generated_reply")
-            or (
-                "Thanks for sharing those details. "
-                "Could you also share your target timeline and budget range so we can map the right partner fit?"
-            )
-        ),
-        channel=channel,
-        is_generated=True,
-        is_handled=True,
-        rag_source_kb_ids=kb_ids,
-    )
+    
+    # If pricing escalation, do NOT auto-reply to client
+    is_pricing_escalation = classification and "escalate_pricing" in (classification.requires_action or [])
+    
+    if is_pricing_escalation:
+        # Don't send AI reply — human team will respond
+        outbound = Message(
+            conversation_id=conversation.id,
+            conversation_public_uuid=conversation.public_uuid,
+            sender_type="system",
+            sender_id=None,
+            message_type="internal",
+            message="⚠️ Pricing inquiry detected. Escalated to human team. Awaiting manual response.",
+            channel=channel,
+            is_generated=True,
+            is_handled=False,
+            rag_source_kb_ids=[],
+        )
+        conversation.status = "pending_human"
+        conversation.is_escalated = True
+    else:
+        outbound = Message(
+            conversation_id=conversation.id,
+            conversation_public_uuid=conversation.public_uuid,
+            sender_type="agent",
+            sender_id=None,
+            message_type="text",
+            message=(
+                final.get("generated_reply")
+                or (
+                    "Thanks for reaching out! Could you share what type of property you're looking for and your preferred area in Lahore?"
+                )
+            ),
+            channel=channel,
+            is_generated=True,
+            is_handled=True,
+            rag_source_kb_ids=kb_ids,
+        )
     session.add(outbound)
     if inbound_message:
         inbound_message.is_handled = True

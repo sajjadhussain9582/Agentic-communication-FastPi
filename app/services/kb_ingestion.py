@@ -66,13 +66,21 @@ def process_text_content(
 
 def extract_text_from_pdf(file_path: str) -> str:
     """Extracts raw text from a PDF file."""
-    import PyPDF2
     text = ""
     try:
+        import PyPDF2
+
         with open(file_path, "rb") as f:
             reader = PyPDF2.PdfReader(f)
             for page in reader.pages:
-                text += page.extract_text() + "\n"
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+    except ModuleNotFoundError as e:
+        logger.error(f"PDF Extraction Error: missing dependency: {e}")
+        raise ValueError(
+            "PDF support is unavailable because PyPDF2 is not installed."
+        ) from e
     except Exception as e:
         logger.error(f"PDF Extraction Error: {e}")
         raise ValueError(f"Could not extract text from PDF: {e}")

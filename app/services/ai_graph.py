@@ -16,6 +16,7 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg_pool import ConnectionPool
 from langgraph.graph import END, StateGraph
 from langgraph.types import Command, interrupt
+from sqlalchemy.orm.attributes import flag_modified
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
@@ -34,8 +35,24 @@ from app.services.workflow_engine import run_decision_workflows
 
 logger = logging.getLogger(__name__)
 
+_LOG_PREVIEW_LIMIT = 160
+
 def _rag_debug_enabled() -> bool:
     return os.getenv("RAG_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _preview_text(value: Any, limit: int = _LOG_PREVIEW_LIMIT) -> str:
+    text = str(value or "").strip().replace("\n", " ")
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _structured_log(event: str, **payload: Any) -> None:
+    try:
+        logger.info("%s %s", event, json.dumps(payload, default=str, ensure_ascii=False))
+    except Exception:
+        logger.info("%s %s", event, payload)
 
 # Global checkpointer for human-in-the-loop interrupts
 _memory_saver = MemorySaver()
@@ -79,10 +96,14 @@ def setup_checkpointer():
 
 class MessageClassification(BaseModel):
     """Structured output from the classification node."""
-    role_type: str = Field(description="one of: contractor, agent, developer, architect, builder, unknown")
-    intent_type: str = Field(description="one of: service_inquiry, pricing_request, booking_request, partnership_inquiry, support_request, follow_up, complaint, nurture")
+    role_type: str = Field(
+        description="one of: buyer, seller, landlord, tenant, investor, agent, developer, contractor, architect, builder, unknown"
+    )
+    intent_type: str = Field(
+        description="one of: property_search, buying_request, selling_request, rent_inquiry, service_inquiry, pricing_request, booking_request, support_request, follow_up, complaint, nurture, partnership_inquiry"
+    )
     relationship_type: str = Field(description="one of: inbound_lead, outbound_prospect, referral_partner, existing_client, dormant_lead, reengaged_lead")
-    decision_role: str = Field(description="one of: decision_maker, influencer, researcher, assistant, unknown")
+    decision_role: str = Field(description="one of: decision_maker, influencer, researcher, assistant, family_member, broker, unknown")
     engagement_temperature: str = Field(description="one of: cold, warm, hot")
     qualification_stage: str = Field(description="one of: discovery, qualified, not_qualified, needs_info")
     is_escalated: bool = Field(description="True if human intervention is explicitly needed")
@@ -95,12 +116,321 @@ class MessageClassification(BaseModel):
     project_scope: str | None = Field(description="scope details from user")
     decision_authority: str | None = Field(description="who makes decisions")
     geography: str | None = Field(description="location of project")
+    transaction_type: str | None = Field(description="buy, sell, rent, let, or invest")
+    must_have_features: list[str] = Field(default_factory=list, description="important property requirements")
+    out_of_scope: bool = Field(default=False, description="true if request is outside the Lahore property domain")
     new_pipeline_stage: str = Field(description="The stage the AI decides to move them to (discovery, qualified, proposal_ready, etc.)")
     close_readiness_score: float = Field(description="number 0-100")
     requires_action: list[str] = Field(description="List of actions: 'update_status', 'send_calendly', 'send_proposal'")
     missing_qualification_fields: list[str] = Field(description="Fields still needed: scope, budget, timeline, location, stakeholders")
     filled_fields: list[str] = Field(default_factory=list, description="Fields already filled: project_type, scope, budget_signal, timeline_signal, location, stakeholders, must_have_features")
     next_best_questions: list[str] = Field(description="1-3 short questions to ask next")
+
+
+DOMAIN_PROFILE: dict[str, Any] = {
+    "name": "lahore_property",
+    "service_area": "Lahore",
+    "default_stage": "discovery",
+    "question_priority": [
+        "budget",
+        "property_type",
+        "location",
+        "timeline",
+        "decision_authority",
+        "must_have_features",
+    ],
+    "stage_order": ["lead", "discovery", "qualified", "consultation", "proposal_ready", "negotiation", "won", "lost"],
+    "out_of_scope_keywords": [
+        "website",
+        "web app",
+        "mobile app",
+        "software",
+        "saas",
+        "crm system",
+        "erp",
+        "api integration",
+        "app development",
+        "it project",
+    ],
+    "property_keywords": [
+        "house",
+        "home",
+        "apartment",
+        "flat",
+        "plot",
+        "villa",
+        "shop",
+        "office",
+        "commercial",
+        "residential",
+        "rent",
+        "purchase",
+        "buy",
+        "sell",
+        "lahore",
+        "dha",
+        "bahria",
+        "gulberg",
+        "johar town",
+        "cantt",
+        "model town",
+        "askari",
+        "wapda town",
+        "garden town",
+        "lake city",
+        "park view",
+    ],
+}
+
+_PROPERTY_TYPE_PATTERNS: list[tuple[str, str]] = [
+    (r"\b(4|five|5)\s*-?\s*bed(room)?\b", "4-5 bedroom house"),
+    (r"\b(3|4|5)\s*-?bed\b", "multi-bedroom home"),
+    (r"\bhouse\b", "house"),
+    (r"\bflat\b|\bapartment\b", "apartment"),
+    (r"\bplot\b", "plot"),
+    (r"\bvilla\b", "villa"),
+    (r"\bshop\b", "shop"),
+    (r"\boffice\b", "office"),
+    (r"\bcommercial\b", "commercial property"),
+    (r"\bresidential\b", "residential property"),
+]
+
+_QUESTION_LIBRARY: dict[str, str] = {
+    "budget": "What budget range are you working with?",
+    "property_type": "Are you looking for a house, apartment, plot, or something else?",
+    "location": "Which area of Lahore are you focused on?",
+    "timeline": "When are you planning to buy or move?",
+    "decision_authority": "Will anyone else be involved in the next step?",
+    "must_have_features": "Are there any must-have features such as bedrooms, parking, garden, or corner plot?",
+}
+
+
+def _normalize_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _safe_str_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        return [v.strip() for v in value.split(",") if v.strip()]
+    return []
+
+
+def _domain_stage_rank(stage: str | None) -> int:
+    if not stage:
+        return 1
+    stage = stage.lower().strip()
+    stage_order = DOMAIN_PROFILE["stage_order"]
+    if stage in stage_order:
+        return stage_order.index(stage)
+    if "proposal" in stage or "estimation" in stage:
+        return 4
+    if "consult" in stage:
+        return 3
+    if "qualified" in stage:
+        return 2
+    if "discovery" in stage or "requirements" in stage:
+        return 1
+    if "lost" in stage:
+        return 7
+    return 1
+
+
+def _is_property_related(text: str) -> bool:
+    lower = (text or "").lower()
+    return any(keyword in lower for keyword in DOMAIN_PROFILE["property_keywords"])
+
+
+def _is_out_of_scope(text: str) -> bool:
+    lower = (text or "").lower()
+    if any(keyword in lower for keyword in DOMAIN_PROFILE["property_keywords"]):
+        return False
+    return any(keyword in lower for keyword in DOMAIN_PROFILE["out_of_scope_keywords"])
+
+
+def _extract_location(text: str) -> str | None:
+    lower = text.lower()
+    for keyword in (
+        "dha",
+        "bahria",
+        "gulberg",
+        "johar town",
+        "cantt",
+        "model town",
+        "askari",
+        "wapda town",
+        "garden town",
+        "lake city",
+        "park view",
+    ):
+        if keyword in lower:
+            return keyword.title()
+    location_match = re.search(r"\b(?:in|at|near)\s+([A-Za-z][A-Za-z\s\-]{2,40})", text)
+    if location_match:
+        return location_match.group(1).strip()
+    return None
+
+
+def _extract_property_type(text: str) -> str | None:
+    lower = text.lower()
+    for pattern, label in _PROPERTY_TYPE_PATTERNS:
+        if re.search(pattern, lower, flags=re.I):
+            return label
+    return None
+
+
+def _extract_slot_state(user_text: str, contact: Contact) -> dict[str, Any]:
+    text = (user_text or "").lower()
+    slots: dict[str, Any] = {}
+    ext = contact.external_ids if isinstance(contact.external_ids, dict) else {}
+    prev_slots = ext.get("slots", {}) if isinstance(ext, dict) else {}
+    if isinstance(prev_slots, dict):
+        slots.update(prev_slots)
+
+    if contact.project_type and "project_type" not in slots:
+        slots["project_type"] = contact.project_type
+    if contact.budget and "budget_signal" not in slots:
+        slots["budget_signal"] = contact.budget
+    if contact.timeline and "timeline_signal" not in slots:
+        slots["timeline_signal"] = contact.timeline
+
+    property_type = _extract_property_type(text)
+    if property_type:
+        slots["project_type"] = property_type
+
+    location = _extract_location(user_text)
+    if location:
+        slots["location"] = location
+
+    if re.search(r"\b(?:buy|buying|purchase|purchasing|own|invest|investment)\b", text):
+        slots["transaction_type"] = "buy"
+    elif re.search(r"\b(?:rent|rental|lease|leasing)\b", text):
+        slots["transaction_type"] = "rent"
+    elif re.search(r"\b(?:sell|selling|list|listing)\b", text):
+        slots["transaction_type"] = "sell"
+
+    if re.search(r"\b(?:decision maker|decision-maker|final decision|final say|owner|family|spouse|partner|parents)\b", text):
+        slots["decision_authority"] = user_text[:160]
+
+    if re.search(r"\b(?:budget|pk r|pkr|rupees?|lakhs?|lac|crore|million|m)\b", text):
+        slots["budget_signal"] = user_text[:200]
+
+    if re.search(r"\b(?:week|weeks|month|months|quarter|deadline|asap|soon|immediately|urgent|within)\b", text):
+        slots["timeline_signal"] = user_text[:200]
+
+    if re.search(r"\b(?:bedroom|bed rooms?|parking|garage|garden|corner|park facing|main road|furnished|sqm|marla|kanal)\b", text):
+        slots["must_have_features"] = user_text[:200]
+
+    if re.search(r"\b(?:house|home|apartment|flat|plot|villa|shop|office|commercial|residential)\b", text) and "project_type" not in slots:
+        slots["project_type"] = user_text[:160]
+
+    return slots
+
+
+def _merge_contact_state(contact: Contact, extracted_slots: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(extracted_slots)
+    ext = contact.external_ids if isinstance(contact.external_ids, dict) else {}
+    prev_slots = ext.get("slots", {}) if isinstance(ext, dict) else {}
+    if isinstance(prev_slots, dict):
+        for key, value in prev_slots.items():
+            if value and key not in merged:
+                merged[key] = value
+
+    for key, value in (
+        ("project_type", contact.project_type),
+        ("budget_signal", contact.budget),
+        ("timeline_signal", contact.timeline),
+    ):
+        if value and key not in merged:
+            merged[key] = value
+
+    return merged
+
+
+def _missing_fields_from_slots(slots: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    if not _normalize_text(slots.get("budget_signal")):
+        missing.append("budget")
+    if not _normalize_text(slots.get("project_type")):
+        missing.append("property_type")
+    if not _normalize_text(slots.get("location")):
+        missing.append("location")
+    if not _normalize_text(slots.get("timeline_signal")):
+        missing.append("timeline")
+    if not _normalize_text(slots.get("decision_authority")):
+        missing.append("decision_authority")
+    if not _safe_str_list(slots.get("must_have_features")) and not _normalize_text(slots.get("must_have_features")):
+        missing.append("must_have_features")
+    return missing
+
+
+def _select_next_questions(missing_fields: list[str], slots: dict[str, Any], user_text: str) -> list[str]:
+    if not missing_fields:
+        return []
+    priority = list(DOMAIN_PROFILE["question_priority"])
+    questions: list[str] = []
+    for field in priority:
+        if field in missing_fields:
+            questions.append(_QUESTION_LIBRARY[field])
+        if len(questions) >= 2:
+            break
+    if not questions:
+        questions.append("Could you share a bit more detail so I can narrow this down for you?")
+    if _is_property_related(user_text) and "location" not in missing_fields and not _normalize_text(slots.get("location")):
+        questions.insert(0, _QUESTION_LIBRARY["location"])
+    return questions[:2]
+
+
+def _build_qualification_view(user_text: str, contact: Contact) -> dict[str, Any]:
+    extracted = _extract_slot_state(user_text, contact)
+    slots = _merge_contact_state(contact, extracted)
+    missing = _missing_fields_from_slots(slots)
+    next_questions = _select_next_questions(missing, slots, user_text)
+    readiness = 0
+    for key, weight in (
+        ("project_type", 25),
+        ("budget_signal", 25),
+        ("timeline_signal", 20),
+        ("location", 15),
+        ("decision_authority", 15),
+    ):
+        if _normalize_text(slots.get(key)):
+            readiness += weight
+    if _safe_str_list(slots.get("must_have_features")) or _normalize_text(slots.get("must_have_features")):
+        readiness += 5
+    readiness = min(readiness, 100)
+    if readiness >= 75 and not missing:
+        stage = "consultation"
+    elif readiness >= 55 and len(missing) <= 2:
+        stage = "qualified"
+    elif readiness >= 35:
+        stage = "discovery"
+    else:
+        stage = "discovery"
+    return {
+        "slots": slots,
+        "missing_fields": missing,
+        "next_best_questions": next_questions,
+        "readiness": readiness,
+        "stage": stage,
+    }
+
+
+def should_include_cta(
+    *,
+    conversation_turn: int,
+    cta_readiness_score: float | int | None,
+    missing_fields: list[str] | None,
+    conversation_stage: str | None,
+) -> bool:
+    stage_rank = _domain_stage_rank(conversation_stage)
+    score = float(cta_readiness_score or 0)
+    missing = set(missing_fields or [])
+
+    if stage_rank >= 3:
+        return True
+    return score >= 80 and len(missing) <= 1
 
 class AgentState(TypedDict, total=False):
     # Inputs
@@ -116,6 +446,8 @@ class AgentState(TypedDict, total=False):
     conversation_id: int
     contact_name: str
     agent_name: str
+    qualification_view: dict[str, Any]
+    slot_context: str
     
     # Typed Outputs
     classification: MessageClassification | None
@@ -126,400 +458,188 @@ class AgentState(TypedDict, total=False):
     error: str
 
 PERSONA_POLICIES: dict[str, dict[str, str]] = {
-   "contractor": {
-        "focus": "identify if they need execution support or are open to partnership for handling overflow or specialized work",
-        "value": "we help contractors deliver projects faster by handling design, planning, and execution through our in-house team",
-        "questions": "are you looking for project support or additional leads, what type of projects do you handle, what challenges are you facing currently",
-        "cta": "If they need support, move toward consultation; if partnership fit, propose a partnership alignment call",
+    "buyer": {
+        "focus": "qualify the buyer's budget, preferred location, property type, timing, and who should be involved",
+        "value": "we help buyers find the right Lahore property options and move quickly to a consultation when they are ready",
+        "questions": "budget range, preferred area in Lahore, property type, timeline, who should be involved, must-have features",
+        "cta": "If the lead is ready, offer a consultation and share the booking link",
     },
-
+    "seller": {
+        "focus": "understand the asset, asking price, location, timeline, and who should be included",
+        "value": "we help sellers position and move property efficiently with a professional response flow",
+        "questions": "property type, location, asking price, desired selling timeline, who should be included",
+        "cta": "If details are clear, offer consultation or human handoff",
+    },
+    "landlord": {
+        "focus": "qualify the rental property, expected rent, location, occupancy timeline, and who should be involved",
+        "value": "we help landlords handle rental inquiries and move qualified conversations forward",
+        "questions": "property type, location, rent target, availability timeline, who should be involved",
+        "cta": "If the lead is ready, move toward a consultation or booking link",
+    },
+    "tenant": {
+        "focus": "understand rental budget, area, lease timeline, and property requirements",
+        "value": "we help tenants find suitable rental options in Lahore without wasting their time",
+        "questions": "budget, area, move-in date, bedrooms, and must-have features",
+        "cta": "If qualified, offer a consultation or send suitable options",
+    },
+    "investor": {
+        "focus": "identify yield goals, budget, area preference, holding period, and readiness",
+        "value": "we help investors evaluate property opportunities that match their timeline and return goals",
+        "questions": "budget, area, goal, holding period, and who should be involved",
+        "cta": "If qualified, propose consultation",
+    },
     "agent": {
-        "focus": "determine if they are a referral partner or have clients needing design/build services",
-        "value": "we help agents close more deals by supporting their clients with end-to-end project execution",
-        "questions": "do your clients require design or construction services, what markets do you serve, how often do you get such requirements",
-        "cta": "If referral potential exists, propose partnership call; if direct project, move toward consultation",
+        "focus": "determine if they have a client needing property support or want a referral partnership",
+        "value": "we help agents move client opportunities faster and keep communication professional",
+        "questions": "client requirement, area, budget, timeline, and who should be involved",
+        "cta": "If qualified, move toward consultation or partnership discussion",
     },
-
     "developer": {
-    "focus": "determine if they are a serious property / real-estate developer or long-term build partner; assess project scope, stakeholders, and delivery expectations",
-    "questions": "project type (residential/commercial), phases, stakeholders involved, budget range, deployment timeline, decision authority",
-    "cta": "If qualified, propose a discovery/consultation call about their real-estate or construction projects; if early-stage, continue structured qualification before          booking.",
+        "focus": "assess project scope, stakeholders, location, budget, and deployment timeline",
+        "value": "we help developers and property teams qualify opportunities and coordinate next steps",
+        "questions": "project type, budget, timeline, stakeholders, and area",
+        "cta": "If qualified, propose a consultation",
     },
-
+    "contractor": {
+        "focus": "retain compatibility with legacy leads while still qualifying property-related needs",
+        "value": "we support contractors involved in property work and related project needs",
+        "questions": "project type, budget, timeline, and location",
+        "cta": "If qualified, move toward consultation",
+    },
     "architect": {
-        "focus": "identify if they need execution support or collaboration for delivering projects",
-        "value": "we support architects by executing their designs and handling project delivery end-to-end",
-        "questions": "are you looking for execution support, what stage is your project in, who is the end client, timeline and budget clarity",
-        "cta": "If collaboration fit, propose partnership discussion; if direct project, guide to consultation",
+        "focus": "retain compatibility with legacy leads while still qualifying property-related needs",
+        "value": "we support architects involved in property projects",
+        "questions": "project type, budget, timeline, and location",
+        "cta": "If qualified, move toward consultation",
     },
-
     "builder": {
-        "focus": "assess if they need operational support or collaboration for project delivery",
-        "value": "we help builders streamline delivery by handling planning, design coordination, and execution support",
-        "questions": "what type of builds do you handle, current bottlenecks, project volume, timeline and budget signals",
-        "cta": "If high intent, move toward consultation or partnership kickoff depending on context",
+        "focus": "retain compatibility with legacy leads while still qualifying property-related needs",
+        "value": "we support builders involved in property projects",
+        "questions": "project type, budget, timeline, and location",
+        "cta": "If qualified, move toward consultation",
     },
-
     "unknown": {
-        "focus": "identify role, intent, and seriousness quickly without making assumptions",
-        "value": "we support real-estate and construction stakeholders with architecture, planning, and execution",
-        "questions": "what type of property/construction project you need support with, your role, budget, timeline, and decision authority",
+        "focus": "identify the buyer, seller, landlord, tenant, or investor role quickly and politely",
+        "value": "we help with Lahore property conversations and move serious leads to the right next step",
+        "questions": "budget, location, property type, timeline, and who should be involved",
         "cta": "If in-scope and clear, guide to consultation; otherwise request clarification politely",
     },
 }
 
-DECISION_PROMPT = """You are an AI Sales Manager for a B2B services company of real estate (• Contractors
-• Real estate agents
-• Real estate developersz
-• architects
-• home builders)
+DECISION_PROMPT = """You are a Lahore property qualification engine.
 
-Your responsibility is to:
-- qualify leads accurately
-- determine the safest valid pipeline stage
-- identify blockers preventing progression
-- decide the next best action to move the deal forward
-- avoid premature stage advancement
+Goal:
+- classify the incoming message
+- extract dynamic BANT-style property signals from arbitrary phrasing
+- decide the safest next stage
+- decide whether the lead should be booked, qualified, or escalated
 
-You MUST output ONLY valid JSON with the following keys:
+You must output ONLY valid JSON.
 
-- role_type: one of: contractor, agent, developer, architect, builder, unknown
-- intent_type: one of: service_inquiry, pricing_request, booking_request, partnership_inquiry, support_request, follow_up, complaint, nurture
-- relationship_type: one of: inbound_lead, outbound_prospect, referral_partner, existing_client, dormant_lead, reengaged_lead
-- decision_role: one of: decision_maker, influencer, researcher, assistant, unknown
-- engagement_temperature: one of: cold, warm, hot
-- qualification_stage: one of: discovery, qualified, not_qualified, needs_info
-- is_escalated: true or false
-- conversation_status: one of: open, pending_human, closed
-- lead_score: number between 0-100 or null
-- is_qualified: true, false, or null
-- budget: string or null
-- project_type: string or null
-- timeline: string or null
-- project_scope: string or null
-- decision_authority: string or null
-- geography: string or null
-- new_pipeline_stage: one of: discovery, qualified, consultation, proposal_ready, negotiation, won, lost
-- close_readiness_score: number between 0-100
-- requires_action: array of actions from: update_status, send_calendly, send_proposal
-- missing_qualification_fields: array from: scope, budget, timeline, location, stakeholders, constraints
-- filled_fields: array from: project_type, scope, budget_signal, timeline_signal, location, stakeholders, must_have_features
-- next_best_questions: array of 1-3 short questions
+Use this domain profile:
+{domain_profile}
 
------------------------------
-STAGE EVIDENCE RULES (STRICT)
------------------------------
+Observed contact state:
+{slot_context}
 
-You MUST follow these rules when setting new_pipeline_stage:
+Conversation context:
+{recent_context}
 
-- discovery:
-  default when key qualification data is missing
-
-- qualified:
-  ONLY if ALL are present:
-  - project_type
-  - budget or budget_signal
-  - timeline or timeline_signal
-
-- consultation:
-  ONLY if:
-  - qualified conditions are met
-  AND
-  - user shows intent (asks next steps, pricing, availability, or moving forward)
-
-- proposal_ready:
-  ONLY if:
-  - scope is clearly defined
-  AND
-  - decision authority or stakeholders are identified
-  AND
-  - user shows execution intent
-
-- negotiation:
-  ONLY if:
-  - pricing or terms discussion has started
-  OR
-  - user is comparing options
-
-- won:
-  ONLY if:
-  - explicit acceptance or commitment is present
-
-- lost:
-  ONLY if:
-  - explicit rejection OR clearly irrelevant/spam
-
-IMPORTANT:
-- DO NOT skip stages
-- DO NOT assume missing data
-- If required fields are missing → stay in earlier stage
-- It is better to stay one stage behind than move too early
-
---------------------------------
-MISSING FIELD HARD CONSTRAINTS
---------------------------------
-
-- If budget OR timeline is missing → MUST NOT exceed "discovery"
-- If scope is missing → MUST NOT exceed "qualified"
-- If stakeholders/decision authority missing → MUST NOT exceed "consultation"
-
---------------------------------
-LEAD SCORING RULES (0–100)
---------------------------------
-
-Assign lead_score based on:
-
-- +25 → clear project_type
-- +25 → budget mentioned
-- +20 → timeline mentioned
-- +15 → urgency (ASAP, soon, active project)
-- +15 → decision authority identified
-
-Score interpretation:
-- 0–40 → cold
-- 41–70 → warm
-- 71–100 → hot
-
---------------------------------
-ACTION RULES
---------------------------------
-
-- include "send_calendly" ONLY if:
-  - stage is "qualified" or higher
-  AND
-  - engagement_temperature is "warm" or "hot"
-
-- include "send_proposal" ONLY if:
-  - stage is "proposal_ready" or higher
-
-- include "update_status" ONLY if:
-  - new_pipeline_stage differs from current logical stage
-
---------------------------------
-DECISION THINKING
---------------------------------
-
-At every step determine:
-
-1. Is this a real opportunity?
-2. What information is missing?
-3. What is blocking progress?
-4. What is the safest next step?
-
---------------------------------
-GENERAL RULES
---------------------------------
-
-- Keep outputs factual and concise
-- Do NOT hallucinate missing data
-- If uncertain → return null and include in missing_qualification_fields
-- Prefer safe progression over aggressive advancement
-- Do not include any keys outside the schema
-
---------------------------------
-OUT-OF-DOMAIN GUARDRAIL (SOFTWARE/WEB)
---------------------------------
-
-- This system serves ONLY the real estate / construction ecosystem:
-  contractors, real-estate agents, real-estate developers, architects, home builders.
-- If the message is clearly about websites, web apps, SaaS platforms, or generic IT/software development,
-  then treat it as OUT OF SCOPE:
-  - Set role_type = "unknown".
-  - Set is_qualified = false.
-  - Prefer qualification_stage = "not_qualified".
-  - Prefer new_pipeline_stage = "lost" or stay at "discovery".
-  - In requires_action, DO NOT include send_calendly or send_proposal.
-
---------------------------------
-
-Form/channel context:
-{json_snapshot}
+FAQ / knowledge hints:
+{rag_context}
 
 User message:
 {user_text}
 
-Knowledge base excerpts:
-{rag_context}
+Output schema:
+- role_type
+- intent_type
+- relationship_type
+- decision_role
+- engagement_temperature
+- qualification_stage
+- is_escalated
+- conversation_status
+- lead_score
+- is_qualified
+- budget
+- project_type
+- timeline
+- project_scope
+- decision_authority
+- geography
+- transaction_type
+- must_have_features
+- out_of_scope
+- new_pipeline_stage
+- close_readiness_score
+- requires_action
+- missing_qualification_fields
+- filled_fields
+- next_best_questions
+
+Rules:
+- Treat Lahore property as the default domain.
+- Support any natural phrasing; do not rely on scripted example wording.
+- Extract BANT-style signals:
+  budget, authority, need/property type, timing, location, and must-have features.
+- Ask only the next missing question.
+- If the user asks something that can be answered from the knowledge base, keep the answer grounded and continue qualification.
+- If the message is clearly software/web/app/IT related, mark it out of scope, set is_qualified=false, and move toward lost or closed.
+- If budget, property type, and timeline are present but location is missing, stay in discovery or qualified until location is known.
+- If the lead is ready and asks next steps, booking, consultation, or pricing, move toward consultation and include send_calendly when appropriate.
+- Only move to proposal_ready when scope and decision authority/stakeholders are clear.
+- Do not skip stages.
 """
 
-REPLY_PROMPT = """You are an AI Sales Manager executing the next best sales action.
+REPLY_PROMPT = """You are a Lahore property sales assistant.
 
-Your job is to:
-- qualify efficiently
-- build trust quickly
-- reduce friction
-- move the deal forward toward consultation, proposal, or close
+Write one concise, professional reply that fits the conversation.
 
-Write ONE clear, professional, human-like reply.
-
---------------------------------
-CORE RULES
---------------------------------
-
-- NEVER use placeholders like "[Name]", "[Your Name]", "[City]"
-- Use provided names; if missing, use "Hi," or "Hi there,"
-- Be concise, executive, and natural
-- Do NOT repeat questions already answered
-- Do NOT ask more than 1–2 questions
-- Do NOT overwhelm the user
-
---------------------------------
-OUT-OF-SCOPE HANDLING (CRITICAL)
---------------------------------
-
-- This assistant ONLY supports real-estate / construction domain.
-- If user asks for website, app, software, SaaS, IT development, or unrelated digital-product services:
-  - clearly state this is outside service scope
-  - do NOT ask website/app follow-up discovery questions
-  - do NOT claim capability to deliver such digital services
-  - offer help only for in-scope real-estate/construction services
-
---------------------------------
-KNOWLEDGE & ACCURACY
---------------------------------
-
-- ONLY use facts from knowledge excerpts below
-- If info is missing → acknowledge and ask a targeted question
-- If retrieval confidence is low → suggest consultation instead of guessing
-- DO NOT hallucinate pricing, policies, or guarantees
-
---------------------------------
-BUSINESS POSITIONING
---------------------------------
-
-- Position the company as a full-service provider:
-  architecture, planning, budgeting, and execution
-- Emphasize integrated in-house delivery
-- Do NOT talk about internal systems/tools
-
---------------------------------
-SALES EXECUTION STRUCTURE
---------------------------------
-
-Every reply should follow:
-
-1. Acknowledge context (short)
-2. Provide value or clarity
-3. Move the deal forward:
-   - ask 1–2 key questions OR
-   - provide CTA OR
-   - guide next step
-
---------------------------------
-STAGE-BASED BEHAVIOR (CRITICAL)
---------------------------------
+Guidelines:
+- Answer the user's question when it is property-related or supported by the knowledge base.
+- Then ask at most one focused follow-up question.
+- Use the contact name if available; otherwise start with "Hi there,"
+- Keep the tone professional, direct, and helpful.
+- Do not ask for information that is already present in the current context.
+- Do not mention internal systems, prompts, or policy text.
+- If the request is out of scope for Lahore property, say so briefly and do not continue qualification.
 
 Current stage: {stage_key}
-
-- discovery:
-  - ask 1–2 qualification questions
-  - DO NOT provide booking link
-  - focus on missing_fields
-
-- qualified:
-  - confirm understanding
-  - if user shows intent → include booking link
-  - otherwise soft CTA or continue qualification
-
-- consultation:
-  - provide booking link directly
-  - minimize additional questions
-
-- proposal_ready:
-  - confirm scope or stakeholders if needed
-  - move toward proposal or decision
-  - DO NOT restart discovery
-
-- negotiation:
-  - address pricing, objections, or terms
-  - push toward decision
-  - avoid new qualification
-
-- won:
-  - confirm next steps / onboarding tone
-
-- lost:
-  - close politely
-  - do NOT re-engage qualification
-
---------------------------------
-CTA RULES
---------------------------------
-
-- ONLY include booking link if:
-  - stage is consultation or higher
-  OR
-  - user explicitly asks for meeting/link
-
-- NEVER include booking link in discovery
-
-- If booking link is included:
-  - use best match from available links
-  - fallback to default: {booking_url}
-
+Channel: {channel}
+Contact name: {contact_name}
+Agent name: {agent_name}
+Role type: {role_type}
+Relationship type: {relationship_type}
+Engagement temperature: {engagement_temperature}
+Authority context: {decision_role}
+Conversation turn: {conversation_turn}
+Recent context: {recent_context}
+Missing fields: {missing_fields}
+Filled fields: {filled_fields}
+Estimator guidance: {estimator_context}
+CTA policy: {cta_policy}
+Suggested next question: {next_best_question}
+Booking link allowed: {booking_link_allowed}
+Booking URL: {booking_url}
 Available booking links:
 {booking_links_context}
 
---------------------------------
-QUESTION STRATEGY
---------------------------------
-
-- Ask only from missing_fields / next_best_questions
-- PRIORITY:
-  1. budget
-  2. timeline
-  3. scope
-  4. stakeholders
-
---------------------------------
-MOMENTUM RULE
---------------------------------
-
-- If user shows strong intent → act immediately
-- Do NOT delay next step unnecessarily
-- Do NOT over-qualify a ready buyer
-
---------------------------------
-PERSONA GUIDANCE
---------------------------------
-
-{persona_policy}
-
---------------------------------
-CONTEXT
---------------------------------
-
-- Channel: {channel}
-- Contact name: {contact_name}
-- Agent name: {agent_name}
-- Role type: {role_type}
-- Relationship type: {relationship_type}
-- Engagement temperature: {engagement_temperature}
-- Decision role: {decision_role}
-- Conversation turn: {conversation_turn}
-- Recent context: {recent_context}
-- Missing fields: {missing_fields}
-- Filled fields: {filled_fields}
-- Estimator guidance: {estimator_context}
-- CTA policy: {cta_policy}
-
---------------------------------
-FAQ / KNOWLEDGE
---------------------------------
-
+Knowledge base context:
 {rag_context}
 
---------------------------------
-INTERNAL DECISION CONTEXT
---------------------------------
-
+Decision context:
 {decision_json}
 
---------------------------------
-USER MESSAGE
---------------------------------
-
+User message:
 {user_text}
+
+Reply rules:
+- If booking_link_allowed is true and the lead is ready, include the booking link.
+- Never give more than one follow-up question.
+- If the user is qualified, keep the answer short and move the conversation forward.
+- If the user is not qualified yet, ask the most important missing question only.
+- Do not use internal authority labels in the reply.
 """
 
 ESCALATION_BRIEF_PROMPT = """You are an AI Sales Analyst. Your goal is to summarize the entire conversation and extracted data into a clear, actionable brief that helps a human quickly understand the context of a lead escalation.
@@ -596,9 +716,7 @@ Instructions for fields:
 - AI Notes (Internal): Mention why escalation happened and any inconsistencies/risks.
 """
 def _safe_list(value: Any) -> list[str]:
-    if isinstance(value, list):
-        return [str(v).strip() for v in value if str(v).strip()]
-    return []
+    return _safe_str_list(value)
 
 
 def _build_recent_context(session: Session, conversation_id: int, limit: int = 4) -> str:
@@ -617,40 +735,6 @@ def _build_recent_context(session: Session, conversation_id: int, limit: int = 4
     return " | ".join(parts)
 
 
-def _extract_slot_state(user_text: str, contact: Contact) -> dict[str, Any]:
-    text = (user_text or "").lower()
-    slots: dict[str, Any] = {}
-    ext = contact.external_ids if isinstance(contact.external_ids, dict) else {}
-    prev_slots = ext.get("slots", {}) if isinstance(ext, dict) else {}
-    if isinstance(prev_slots, dict):
-        slots.update(prev_slots)
-
-    if contact.project_type and "project_type" not in slots:
-        slots["project_type"] = contact.project_type
-    if contact.budget and "budget_signal" not in slots:
-        slots["budget_signal"] = contact.budget
-    if contact.timeline and "timeline_signal" not in slots:
-        slots["timeline_signal"] = contact.timeline
-
-    # Treat only real-estate / construction terms as valid project_type triggers.
-    # Explicitly exclude generic software/web dev terms from domain.
-    if re.search(r"\b(house|home|apartment|flat|villa|plot|residential|commercial|building|construction|renovation|remodel)\b", text):
-        slots["project_type"] = user_text[:120]
-    if re.search(r"\b(\$|usd|budget|k\b|million|m\b)\b", text):
-        slots["budget_signal"] = user_text[:120]
-    if re.search(r"\b(week|weeks|month|months|quarter|timeline|deadline|asap)\b", text):
-        slots["timeline_signal"] = user_text[:120]
-    if re.search(r"\b(in|at)\s+[a-zA-Z][a-zA-Z\s]{2,30}\b", text):
-        slots.setdefault("location", user_text[:120])
-    if re.search(r"\b(founder|owner|decision|stakeholder|partner|team)\b", text):
-        slots["stakeholders"] = user_text[:120]
-    if re.search(r"\b(must|need|require|important|feature|integration)\b", text):
-        slots["must_have_features"] = user_text[:200]
-    if re.search(r"\b(scope|full build|mvp|revamp|redesign)\b", text):
-        slots["scope"] = user_text[:200]
-    return slots
-
-
 def _wants_estimate(user_text: str) -> bool:
     text = (user_text or "").lower()
     return any(
@@ -664,6 +748,9 @@ def _wants_estimate(user_text: str) -> bool:
             "estimate",
             "timeline",
             "how long",
+            "monthly",
+            "rent",
+            "purchase",
         )
     )
 
@@ -672,7 +759,7 @@ def _format_estimator_context(user_text: str, slots: dict[str, Any]) -> str:
     est = estimate_project(user_text, slots)
     assumptions = "; ".join(est.get("assumptions", []))
     return (
-        "Use these indicative ranges if user asks budget/time: "
+        "Use these indicative ranges if the lead asks for pricing or timeline guidance: "
         f"MVP {est.get('mvp_budget_range')} ({est.get('mvp_timeline')}), "
         f"Standard {est.get('standard_budget_range')} ({est.get('standard_timeline')}), "
         f"Advanced {est.get('advanced_budget_range')} ({est.get('advanced_timeline')}). "
@@ -691,31 +778,120 @@ def build_graph(session: Session):
     )
 
     def node_classify(state: AgentState) -> Command:
+        contact_id = state.get("contact_id")
+        contact = session.get(Contact, contact_id) if contact_id else None
+        qualification_view = state.get("qualification_view") or {}
+        if not qualification_view and contact:
+            qualification_view = _build_qualification_view(state.get("user_text", ""), contact)
+        slot_context = json.dumps(qualification_view, default=str)[:12000]
+
+        user_text = state.get("user_text", "")
+        if _is_out_of_scope(user_text):
+            classification = MessageClassification(
+                role_type="unknown",
+                intent_type="support_request",
+                relationship_type="inbound_lead",
+                decision_role="unknown",
+                engagement_temperature="cold",
+                qualification_stage="not_qualified",
+                is_escalated=False,
+                conversation_status="closed",
+                lead_score=0.0,
+                is_qualified=False,
+                budget=None,
+                project_type=None,
+                timeline=None,
+                project_scope=None,
+                decision_authority=None,
+                geography=None,
+                transaction_type=None,
+                must_have_features=[],
+                out_of_scope=True,
+                new_pipeline_stage="lost",
+                close_readiness_score=0.0,
+                requires_action=["update_status"],
+                missing_qualification_fields=[],
+                filled_fields=[],
+                next_best_questions=[],
+            )
+            return Command(update={"classification": classification, "qualification_view": qualification_view, "slot_context": slot_context}, goto="draft")
+
         # Fetch dynamic stages from DB
         stages = list(session.exec(select(PipelineStage).order_by(PipelineStage.order_index)).all())
-        stage_info = "\n".join([f"- {s.key}: {s.ai_instructions}" for s in stages])
         valid_keys = ", ".join([s.key for s in stages])
-
         structured_llm = llm.with_structured_output(MessageClassification)
         prompt = DECISION_PROMPT.format(
+            domain_profile=json.dumps(DOMAIN_PROFILE, indent=2),
             json_snapshot=state.get("json_snapshot", "{}"),
-            user_text=state.get("user_text", ""),
-            rag_context="",
+            recent_context=state.get("recent_context", ""),
+            slot_context=slot_context,
+            rag_context=state.get("rag_context", ""),
+            user_text=user_text,
         )
-        # Inject dynamic stages into prompt
-        prompt += f"\n\nAVAILABLE PIPELINE STAGES:\n{stage_info}\n\nRule: new_pipeline_stage MUST be one of: {valid_keys}"
+        prompt += f"\n\nAVAILABLE PIPELINE STAGES:\n{valid_keys}\nRule: new_pipeline_stage MUST be one of these values."
 
         try:
             classification = structured_llm.invoke([HumanMessage(content=prompt)])
+            if contact and qualification_view:
+                slots = qualification_view.get("slots") or {}
+                if not classification.budget and slots.get("budget_signal"):
+                    classification.budget = str(slots.get("budget_signal"))[:2000]
+                if not classification.project_type and slots.get("project_type"):
+                    classification.project_type = str(slots.get("project_type"))[:2000]
+                if not classification.timeline and slots.get("timeline_signal"):
+                    classification.timeline = str(slots.get("timeline_signal"))[:2000]
+                if not classification.project_scope and slots.get("must_have_features"):
+                    mf = slots.get("must_have_features")
+                    classification.project_scope = ", ".join(_safe_str_list(mf)) if isinstance(mf, list) else str(mf)[:2000]
+                if not classification.decision_authority and slots.get("decision_authority"):
+                    classification.decision_authority = str(slots.get("decision_authority"))[:2000]
+                if not classification.geography and slots.get("location"):
+                    classification.geography = str(slots.get("location"))[:2000]
+                if not classification.transaction_type and slots.get("transaction_type"):
+                    classification.transaction_type = str(slots.get("transaction_type"))[:2000]
+                if not classification.must_have_features:
+                    classification.must_have_features = _safe_str_list(slots.get("must_have_features"))
+                if not classification.missing_qualification_fields:
+                    classification.missing_qualification_fields = qualification_view.get("missing_fields", [])
+                if not classification.next_best_questions:
+                    classification.next_best_questions = qualification_view.get("next_best_questions", [])
+                if not classification.close_readiness_score:
+                    classification.close_readiness_score = float(qualification_view.get("readiness", 0))
+                if not classification.new_pipeline_stage:
+                    classification.new_pipeline_stage = str(qualification_view.get("stage", "discovery"))
+                if not classification.lead_score:
+                    classification.lead_score = float(qualification_view.get("readiness", 0))
+                if classification.new_pipeline_stage not in {s.key for s in stages}:
+                    classification.new_pipeline_stage = "discovery"
+                if classification.new_pipeline_stage in {"qualified", "consultation", "proposal_ready"} and "send_calendly" not in (classification.requires_action or []):
+                    classification.requires_action = list(classification.requires_action or []) + ["send_calendly"]
+            _structured_log(
+                "AI classification",
+                conversation_id=state.get("conversation_id"),
+                contact_id=contact_id,
+                role_type=classification.role_type,
+                intent_type=classification.intent_type,
+                decision_role=classification.decision_role,
+                qualification_stage=classification.qualification_stage,
+                new_pipeline_stage=classification.new_pipeline_stage,
+                readiness=classification.close_readiness_score,
+                lead_score=classification.lead_score,
+                is_qualified=classification.is_qualified,
+                requires_action=classification.requires_action,
+                missing_fields=classification.missing_qualification_fields,
+                filled_fields=classification.filled_fields,
+                out_of_scope=classification.out_of_scope,
+                slot_keys=sorted(list((qualification_view.get("slots") or {}).keys())),
+            )
             if classification.is_escalated:
-                return Command(update={"classification": classification}, goto="human_review")
+                return Command(update={"classification": classification, "qualification_view": qualification_view, "slot_context": slot_context}, goto="human_review")
             elif "update_status" in (classification.requires_action or []):
-                return Command(update={"classification": classification}, goto="update_status")
+                return Command(update={"classification": classification, "qualification_view": qualification_view, "slot_context": slot_context}, goto="update_status")
             else:
-                return Command(update={"classification": classification}, goto="retrieve")
+                return Command(update={"classification": classification, "qualification_view": qualification_view, "slot_context": slot_context}, goto="retrieve")
         except Exception as e:
             logger.error(f"Classification error: {e}")
-            return Command(goto="retrieve")
+            return Command(update={"qualification_view": qualification_view, "slot_context": slot_context}, goto="retrieve")
 
     def node_retrieve(state: AgentState) -> Command:
         q = state.get("user_text", "")[:8000]
@@ -746,6 +922,19 @@ def build_graph(session: Session):
                         for c in chunks[:5]
                     ],
                 )
+        _structured_log(
+            "AI retrieval",
+            conversation_id=state.get("conversation_id"),
+            contact_id=state.get("contact_id"),
+            query_preview=_preview_text(q),
+            detected_category=routed_category,
+            matched=bool(chunks),
+            top_matches=[
+                {"id": c.id, "score": round(float(c.score), 3), "category": c.category}
+                for c in chunks[:3]
+            ],
+            matched_kb_ids=kb_ids[:5],
+        )
         rag_ctx = format_rag_context(chunks)
         return Command(
             update={"rag_context": rag_ctx, "rag_kb_ids": kb_ids},
@@ -776,8 +965,9 @@ def build_graph(session: Session):
 
     def node_draft(state: AgentState) -> Command:
         classification = state.get("classification")
-        stage_key = classification.new_pipeline_stage if classification else "discovery"
-        
+        qualification_view = state.get("qualification_view") or {}
+        stage_key = classification.new_pipeline_stage if classification else qualification_view.get("stage", "discovery")
+
         # Format booking links context from state
         booking_links = state.get("booking_links", [])
         booking_links_context = ""
@@ -790,34 +980,54 @@ def build_graph(session: Session):
         ).first()
         stage_instruction = stage_record.ai_instructions if stage_record else ""
 
-        # Stage-driven prompt logic (use role_type, not intent_type)
-        persona_segment = classification.role_type if classification else "unknown"
+        persona_segment = classification.role_type if classification and classification.role_type in PERSONA_POLICIES else "unknown"
         if persona_segment not in PERSONA_POLICIES:
             persona_segment = "unknown"
         persona_policy = PERSONA_POLICIES[persona_segment]
+        missing_fields = classification.missing_qualification_fields if classification else qualification_view.get("missing_fields", [])
+        next_best_question = ""
+        if classification and classification.next_best_questions:
+            next_best_question = classification.next_best_questions[0]
+        elif qualification_view.get("next_best_questions"):
+            next_best_question = qualification_view["next_best_questions"][0]
+        readiness = classification.close_readiness_score if classification else qualification_view.get("readiness", 0)
+        booking_link_allowed = should_include_cta(
+            conversation_turn=state.get("conversation_turn", 1),
+            cta_readiness_score=readiness,
+            missing_fields=missing_fields,
+            conversation_stage=stage_key,
+        )
+
+        if classification and getattr(classification, "out_of_scope", False):
+            reply = (
+                f"Hi there, I can help with Lahore property questions and lead qualification, "
+                f"but this request is outside our property scope."
+            )
+            return Command(update={"generated_reply": reply}, goto=END)
 
         prompt = REPLY_PROMPT.format(
             channel=state.get("channel", "website"),
             contact_name=state.get("contact_name", "there"),
             agent_name=state.get("agent_name", "StrategistHub"),
             stage_key=stage_key,
-            relationship_type="inbound_lead", # Default
-            engagement_temperature="warm",
-            decision_role="decision_maker",
+            relationship_type=classification.relationship_type if classification else "inbound_lead",
+            engagement_temperature=classification.engagement_temperature if classification else "warm",
+            decision_role=classification.decision_role if classification else "unknown",
             rag_context=state.get("rag_context", ""),
             decision_json=json.dumps(classification.model_dump()) if classification else "{}",
             user_text=state.get("user_text", ""),
             booking_url=state.get("booking_url", ""),
             booking_links_context=booking_links_context,
-            persona_segment=persona_segment,
             role_type=persona_segment,
             persona_policy=json.dumps(persona_policy),
             conversation_turn=state.get("conversation_turn", 1),
             recent_context=state.get("recent_context", ""),
-            missing_fields=", ".join(classification.missing_qualification_fields) if classification else "",
+            missing_fields=", ".join(missing_fields) if missing_fields else "",
             filled_fields=state.get("filled_fields", ""),
             estimator_context=state.get("estimator_context", ""),
             cta_policy=stage_instruction,
+            next_best_question=next_best_question,
+            booking_link_allowed=str(booking_link_allowed).lower(),
         )
         
         out = llm.invoke([
@@ -825,6 +1035,31 @@ def build_graph(session: Session):
             HumanMessage(content=prompt)
         ])
         reply = out.content if hasattr(out, "content") else str(out)
+        include_booking_link = bool(
+            booking_link_allowed
+            and state.get("booking_url")
+            and "http" not in reply.lower()
+            and "booking" not in reply.lower()
+        )
+        if include_booking_link:
+            reply = reply.rstrip() + f"\n\nBooking link: {state.get('booking_url')}"
+        _structured_log(
+            "AI reply",
+            conversation_id=state.get("conversation_id"),
+            contact_id=state.get("contact_id"),
+            stage=stage_key,
+            readiness=readiness,
+            missing_fields=missing_fields,
+            next_best_question=next_best_question,
+            booking_link_allowed=booking_link_allowed,
+            booking_link_included=include_booking_link,
+            reply_mode=(
+                "booking_link"
+                if include_booking_link
+                else ("qualification_question" if missing_fields else "answer")
+            ),
+            reply_preview=_preview_text(reply),
+        )
         return Command(update={"generated_reply": reply.strip()}, goto=END)
 
     def node_human_review(state: AgentState) -> Command:
@@ -932,14 +1167,36 @@ async def run_ai_pipeline(
     else:
         user_text = inbound_message.message
 
-    # Check for keywords to assume defaults and provide plan
-    keywords = ["immediately", "proceed", "yes"]
-    if any(kw in user_text.lower() for kw in keywords):
-        user_text += " Assume defaults: project type is double-storey, timeline is ASAP. Provide a detailed plan instead of asking more questions. Use new KB entries for guidance."
-        # Clear recent context to avoid looping
-        recent_context = ""
-    else:
-        recent_context = _build_recent_context(session, conversation.id, limit=5)
+    from datetime import datetime
+
+    if _is_out_of_scope(user_text):
+        reply_text = (
+            "Hi there, I can help with Lahore property questions and lead qualification, "
+            "but this request is outside our property scope."
+        )
+        outbound = Message(
+            conversation_id=conversation.id,
+            conversation_public_uuid=conversation.public_uuid,
+            sender_type="agent",
+            sender_id=None,
+            message_type="text",
+            message=reply_text,
+            channel=conversation.channel,
+            is_generated=True,
+            is_handled=True,
+            rag_source_kb_ids=[],
+        )
+        conversation.last_intent = "out_of_scope"
+        conversation.is_escalated = False
+        conversation.status = "closed"
+        conversation.updated_at = datetime.utcnow()
+        contact.updated_at = datetime.utcnow()
+        session.add(conversation)
+        session.add(contact)
+        session.add(outbound)
+        session.commit()
+        session.refresh(outbound)
+        return outbound
 
     # Fetch booking links if Calendly is configured
     booking_links = []
@@ -969,12 +1226,44 @@ async def run_ai_pipeline(
         )
     )
     recent_context = _build_recent_context(session, conversation.id, limit=5)
-    slots = _extract_slot_state(user_text, contact)
+    qualification_view = _build_qualification_view(user_text, contact)
+    slots = qualification_view["slots"]
     estimator_context = _format_estimator_context(user_text, slots) if _wants_estimate(user_text) else ""
 
     contact_name = contact.username or "there"
     if "<" in contact_name and ">" in contact_name:
         contact_name = contact_name.split("<")[0].strip()
+
+    # Persist extracted qualification state before any graph/LLM work so
+    # follow-up logic survives transient model or network failures.
+    ext = contact.external_ids if isinstance(contact.external_ids, dict) else {}
+    ext["slots"] = slots
+    ext["qualification_view"] = qualification_view
+    ext["ai_state"] = {
+        "conversation_stage": qualification_view.get("stage", "discovery"),
+        "missing_fields": qualification_view.get("missing_fields", []),
+        "filled_fields": _safe_list(slots.keys()),
+        "next_action": "ask_missing_info",
+    }
+    contact.external_ids = dict(ext)
+    flag_modified(contact, "external_ids")
+    contact.updated_at = datetime.utcnow()
+    session.add(contact)
+    session.commit()
+    session.refresh(contact)
+
+    _structured_log(
+        "AI inbound",
+        conversation_id=conversation.id,
+        contact_id=contact.id,
+        channel=channel,
+        user_preview=_preview_text(user_text),
+        conversation_turn=max(1, conversation_turn),
+        readiness=qualification_view.get("readiness", 0),
+        stage=qualification_view.get("stage", "discovery"),
+        missing_fields=qualification_view.get("missing_fields", []),
+        slot_keys=sorted(list(slots.keys())),
+    )
 
     graph = build_graph(session)
     initial: AgentState = {
@@ -988,6 +1277,8 @@ async def run_ai_pipeline(
         "recent_context": recent_context,
         "filled_fields": ", ".join(sorted(slots.keys())),
         "estimator_context": estimator_context,
+        "qualification_view": qualification_view,
+        "slot_context": json.dumps(qualification_view, default=str)[:12000],
         "contact_id": contact.id,
         "conversation_id": conversation.id,
         "contact_name": contact_name,
@@ -996,8 +1287,23 @@ async def run_ai_pipeline(
     config = {"configurable": {"thread_id": str(conversation.id)}}
     
     # Execute graph
-    final = graph.invoke(initial, config)
-    
+    try:
+        final = graph.invoke(initial, config)
+    except Exception as e:
+        logger.error(f"AI graph failed; using fallback response: {e}")
+        fallback_questions = qualification_view.get("next_best_questions") or [
+            "Which area of Lahore are you focused on?"
+        ]
+        fallback_reply = (
+            "Thanks for sharing that. "
+            f"{fallback_questions[0]}"
+        )
+        final = {
+            "classification": None,
+            "generated_reply": fallback_reply,
+            "rag_kb_ids": [],
+        }
+
     classification = final.get("classification")
     
     # Update conversation based on classification
@@ -1005,6 +1311,7 @@ async def run_ai_pipeline(
         conversation.last_intent = str(classification.intent_type)[:500]
         conversation.is_escalated = bool(classification.is_escalated)
         conversation.status = str(classification.conversation_status or "open")[:100]
+        conversation.qualification_stage = str(classification.qualification_stage or qualification_view.get("stage") or "discovery")[:100]
         
         # Redundant sync for safety
         sync_pipeline_stage(session, contact, classification.model_dump())
@@ -1020,13 +1327,14 @@ async def run_ai_pipeline(
         if classification.is_qualified is not None:
             contact.is_qualified = bool(classification.is_qualified)
         
-        # Update contact fields
+        # Update contact fields that are persisted on the Contact row.
         for fld in ("budget", "project_type", "timeline"):
             v = getattr(classification, fld)
             if v is not None and str(v).strip():
                 setattr(contact, fld, str(v)[:2000])
+        if classification.must_have_features:
+            contact.tags = list(dict.fromkeys((contact.tags or []) + ["must_have_features"]))
 
-    from datetime import datetime
     conversation.updated_at = datetime.utcnow()
 
     # Governance & Metrics
@@ -1044,6 +1352,18 @@ async def run_ai_pipeline(
     if next_action == "book_consultation":
         record_outcome(session, contact.id, "booking_intent")
 
+    _structured_log(
+        "AI turn_result",
+        conversation_id=conversation.id,
+        contact_id=contact.id,
+        role_type=getattr(classification, "role_type", None),
+        intent_type=getattr(classification, "intent_type", None),
+        qualification_stage=getattr(classification, "qualification_stage", None),
+        next_action=next_action,
+        rag_kb_ids=final.get("rag_kb_ids") or [],
+        generated_reply_preview=_preview_text(final.get("generated_reply") or ""),
+    )
+
     # Persist lightweight state
     ext = contact.external_ids if isinstance(contact.external_ids, dict) else {}
     if classification:
@@ -1053,8 +1373,16 @@ async def run_ai_pipeline(
             "filled_fields": _safe_list(slots.keys()),
             "next_action": next_action,
         }
+        if classification.decision_authority:
+            ext["ai_state"]["decision_authority"] = classification.decision_authority
+        if classification.transaction_type:
+            ext["ai_state"]["transaction_type"] = classification.transaction_type
+        if classification.must_have_features:
+            ext["must_have_features"] = classification.must_have_features
+        ext["qualification_view"] = qualification_view
     ext["slots"] = slots
-    contact.external_ids = ext
+    contact.external_ids = dict(ext)
+    flag_modified(contact, "external_ids")
     contact.updated_at = datetime.utcnow()
 
     # Run workflows

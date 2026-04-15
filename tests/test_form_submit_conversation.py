@@ -1,3 +1,4 @@
+from app.services.ai_graph import REPLY_PROMPT
 from tests.conftest import bearer, register_and_login
 from app.services.ai_graph import should_include_cta
 from app.services.estimator import estimate_project
@@ -10,7 +11,7 @@ def _has_cta(text: str) -> bool:
 
 def _has_qualification_prompt(text: str) -> bool:
     lower = text.lower()
-    return any(token in lower for token in ("scope", "budget", "timeline", "location", "decision"))
+    return any(token in lower for token in ("scope", "budget", "timeline", "location", "who else", "next step"))
 
 
 def test_form_submit_placeholder_ai(client):
@@ -40,8 +41,9 @@ def test_form_submit_placeholder_ai(client):
     assert "is_escalated" in data
     assert "conversation_status" in data
     assert len(data["ai_reply"]) > 40
-    assert _has_cta(data["ai_reply"])
     assert _has_qualification_prompt(data["ai_reply"])
+    assert "calendly.com" not in data["ai_reply"].lower()
+    assert "booking link" not in data["ai_reply"].lower()
     assert "we do not" not in data["ai_reply"].lower()
     assert "we don't" not in data["ai_reply"].lower()
     assert "contractors" in data["ai_reply"].lower() or "partners" in data["ai_reply"].lower()
@@ -77,7 +79,7 @@ def test_dynamic_cta_policy():
             missing_fields=["scope", "budget"],
             conversation_stage="discovery",
         )
-        is True
+        is False
     )
     assert (
         should_include_cta(
@@ -93,7 +95,7 @@ def test_dynamic_cta_policy():
             conversation_turn=3,
             cta_readiness_score=85,
             missing_fields=["constraints"],
-            conversation_stage="estimation_ready",
+            conversation_stage="qualified",
         )
         is True
     )
@@ -106,6 +108,12 @@ def test_dynamic_cta_policy():
         )
         is True
     )
+
+
+def test_client_facing_prompt_avoids_decision_maker_language():
+    lower = REPLY_PROMPT.lower()
+    assert "decision maker" not in lower
+    assert "decision-maker" not in lower
 
 
 def test_rule_based_estimator_ranges():

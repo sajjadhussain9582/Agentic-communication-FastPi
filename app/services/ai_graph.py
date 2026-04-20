@@ -131,14 +131,6 @@ DOMAIN_PROFILE: dict[str, Any] = {
     "name": "lahore_property",
     "service_area": "Lahore",
     "default_stage": "discovery",
-    "question_priority": [
-        "budget",
-        "property_type",
-        "location",
-        "timeline",
-        "decision_authority",
-        "must_have_features",
-    ],
     "stage_order": ["lead", "discovery", "qualified", "consultation", "proposal_ready", "negotiation", "won", "lost"],
     "out_of_scope_keywords": [
         "website",
@@ -195,14 +187,26 @@ _PROPERTY_TYPE_PATTERNS: list[tuple[str, str]] = [
     (r"\bresidential\b", "residential property"),
 ]
 
-_QUESTION_LIBRARY: dict[str, str] = {
-    "budget": "What budget range are you working with?",
-    "property_type": "Are you looking for a house, apartment, plot, or something else?",
-    "location": "Which area of Lahore are you focused on?",
-    "timeline": "When are you planning to buy or move?",
-    "decision_authority": "Will anyone else be involved in the next step?",
-    "must_have_features": "Are there any must-have features such as bedrooms, parking, garden, or corner plot?",
-}
+_THREAD_ECHO_PHRASES: tuple[str, ...] = (
+    "thank you for your prompt response",
+    "thank you for your response",
+    "i will begin searching",
+    "i would be happy to assist",
+    "to better assist you",
+    "i will prioritize finding",
+    "i understand the urgency",
+)
+
+_VAGUE_LOCATION_TERMS: tuple[str, ...] = (
+    "there",
+    "here",
+    "my place",
+    "my area",
+    "near by",
+    "nearabout",
+    "near about",
+    "near around",
+)
 
 
 def _normalize_text(value: Any) -> str:
@@ -268,7 +272,17 @@ def _extract_location(text: str) -> str | None:
             return keyword.title()
     location_match = re.search(r"\b(?:in|at|near)\s+([A-Za-z][A-Za-z\s\-]{2,40})", text)
     if location_match:
-        return location_match.group(1).strip()
+        candidate = location_match.group(1).strip().rstrip(".,;:!?")
+        candidate_lower = candidate.lower()
+        if candidate_lower in _VAGUE_LOCATION_TERMS:
+            return None
+        if any(term in candidate_lower for term in _VAGUE_LOCATION_TERMS):
+            return None
+        if len(candidate.split()) > 5 and not any(
+            keyword in candidate_lower for keyword in DOMAIN_PROFILE["property_keywords"]
+        ):
+            return None
+        return candidate
     return None
 
 
@@ -356,49 +370,86 @@ def _missing_fields_from_slots(slots: dict[str, Any]) -> list[str]:
         missing.append("property_type")
     if not _normalize_text(slots.get("location")):
         missing.append("location")
+    if not _normalize_text(slots.get("transaction_type")):
+        missing.append("transaction_type")
     if not _normalize_text(slots.get("timeline_signal")):
         missing.append("timeline")
-    if not _normalize_text(slots.get("decision_authority")):
-        missing.append("decision_authority")
-    if not _safe_str_list(slots.get("must_have_features")) and not _normalize_text(slots.get("must_have_features")):
-        missing.append("must_have_features")
+    # Note: decision_authority is inferred automatically, not asked
     return missing
 
 
-def _select_next_questions(missing_fields: list[str], slots: dict[str, Any], user_text: str) -> list[str]:
+def _fallback_next_question(slots: dict[str, Any], missing_fields: list[str], user_text: str) -> str:
+    if _is_property_related(user_text) and not _normalize_text(slots.get("location")):
+        return "Which area of Lahore are you focused on?"
+    if not _normalize_text(slots.get("transaction_type")):
+        return "Are you looking to buy, rent, or sell?"
+    if not _normalize_text(slots.get("budget_signal")):
+        return "What budget range are you working with?"
+    if not _normalize_text(slots.get("timeline_signal")):
+        return "When are you planning to move ahead?"
+    return "Could you share a bit more detail so I can help you better?"
+
+
+def _first_or_fallback_question(
+    *,
+    classification: MessageClassification | None,
+    qualification_view: dict[str, Any],
+    user_text: str,
+) -> str:
+    if classification and classification.next_best_questions:
+        return classification.next_best_questions[0]
+    slots = qualification_view.get("slots") if isinstance(qualification_view, dict) else {}
+    missing_fields = qualification_view.get("missing_fields") if isinstance(qualification_view, dict) else []
+    if isinstance(slots, dict):
+        return _fallback_next_question(slots, missing_fields or [], user_text)
+    return "Could you share a bit more detail so I can help you better?"
+
+
+def _build_questionnaire(missing_fields: list[str]) -> str:
+    """Generate a compact questionnaire when multiple core fields are missing."""
     if not missing_fields:
-        return []
-    priority = list(DOMAIN_PROFILE["question_priority"])
-    questions: list[str] = []
-    for field in priority:
-        if field in missing_fields:
-            questions.append(_QUESTION_LIBRARY[field])
-        if len(questions) >= 2:
-            break
+        return ""
+    
+    field_questions = {
+        "transaction_type": "Are you looking to buy, sell, or rent?",
+        "budget": "What budget range are you working with?",
+        "location": "Which area of Lahore are you focused on?",
+        "timeline": "When are you planning to move ahead?",
+        "property_type": "What type of property are you interested in (house, apartment, plot, etc.)?",
+    }
+    
+    questions = []
+    for field in missing_fields[:4]:  # Limit to 4 questions max
+        if field in field_questions:
+            questions.append(field_questions[field])
+    
     if not questions:
-        questions.append("Could you share a bit more detail so I can narrow this down for you?")
-    if _is_property_related(user_text) and "location" not in missing_fields and not _normalize_text(slots.get("location")):
-        questions.insert(0, _QUESTION_LIBRARY["location"])
-    return questions[:2]
+        return ""
+    
+    if len(questions) == 1:
+        return questions[0]
+    
+    # Format as a compact numbered list
+    questionnaire = "To help you better, could you please share:\n" + "\n".join(
+        f"{i+1}. {q}" for i, q in enumerate(questions)
+    )
+    return questionnaire
 
 
 def _build_qualification_view(user_text: str, contact: Contact) -> dict[str, Any]:
     extracted = _extract_slot_state(user_text, contact)
     slots = _merge_contact_state(contact, extracted)
     missing = _missing_fields_from_slots(slots)
-    next_questions = _select_next_questions(missing, slots, user_text)
     readiness = 0
     for key, weight in (
         ("project_type", 25),
         ("budget_signal", 25),
-        ("timeline_signal", 20),
+        ("transaction_type", 20),
+        ("timeline_signal", 15),
         ("location", 15),
-        ("decision_authority", 15),
     ):
         if _normalize_text(slots.get(key)):
             readiness += weight
-    if _safe_str_list(slots.get("must_have_features")) or _normalize_text(slots.get("must_have_features")):
-        readiness += 5
     readiness = min(readiness, 100)
     if readiness >= 75 and not missing:
         stage = "consultation"
@@ -411,10 +462,55 @@ def _build_qualification_view(user_text: str, contact: Contact) -> dict[str, Any
     return {
         "slots": slots,
         "missing_fields": missing,
-        "next_best_questions": next_questions,
+        "next_best_questions": [],
         "readiness": readiness,
         "stage": stage,
     }
+
+
+def _latest_user_text(user_text: str, email_subject: str | None = None) -> str:
+    body = _normalize_text(user_text)
+    subject = _normalize_text(email_subject)
+    if body:
+        return body
+    return subject
+
+
+def _is_thread_echo_reply(reply_text: str, user_text: str) -> bool:
+    reply = (reply_text or "").lower()
+    if not reply:
+        return True
+    if any(phrase in reply for phrase in _THREAD_ECHO_PHRASES):
+        return True
+    latest = (user_text or "").lower()
+    if "prompt response" in reply and "prompt response" not in latest:
+        return True
+    return False
+
+
+def _build_fallback_reply(
+    *,
+    contact_name: str | None,
+    next_best_question: str,
+    missing_fields: list[str],
+    booking_link_allowed: bool,
+    booking_url: str,
+    use_questionnaire: bool = False,
+) -> str:
+    name = _normalize_text(contact_name)
+    greeting = f"Hi {name}," if name else "Hi there,"
+    if not next_best_question:
+        next_best_question = "Could you share a bit more detail so I can help you better?"
+    if use_questionnaire and len(missing_fields) >= 3:
+        body = next_best_question
+    elif "location" in (missing_fields or []):
+        body = next_best_question
+    else:
+        body = next_best_question
+    reply = f"{greeting}\n\nUnderstood. {body}"
+    if booking_link_allowed and booking_url:
+        reply += f"\n\nBooking link: {booking_url}"
+    return reply
 
 
 def should_include_cta(
@@ -435,6 +531,7 @@ def should_include_cta(
 class AgentState(TypedDict, total=False):
     # Inputs
     user_text: str
+    email_subject: str
     is_proactive: bool
     channel: str
     json_snapshot: str
@@ -551,6 +648,9 @@ FAQ / knowledge hints:
 User message:
 {user_text}
 
+Email subject:
+{email_subject}
+
 Output schema:
 - role_type
 - intent_type
@@ -581,29 +681,55 @@ Output schema:
 Rules:
 - Treat Lahore property as the default domain.
 - Support any natural phrasing; do not rely on scripted example wording.
-- Extract BANT-style signals:
-  budget, authority, need/property type, timing, location, and must-have features.
-- Ask only the next missing question.
+- Extract BANT-style signals: budget, authority, need/property type, timing, location, transaction type, and must-have features.
+- Choose the single best next question dynamically from the current turn and slot state.
+- Do not follow a fixed question order or ladder.
+- Do not require must-have features before qualifying the lead.
+- If buy/rent/sell is unclear, ask that when it blocks the next step.
 - If the user asks something that can be answered from the knowledge base, keep the answer grounded and continue qualification.
 - If the message is clearly software/web/app/IT related, mark it out of scope, set is_qualified=false, and move toward lost or closed.
 - If budget, property type, and timeline are present but location is missing, stay in discovery or qualified until location is known.
 - If the lead is ready and asks next steps, booking, consultation, or pricing, move toward consultation and include send_calendly when appropriate.
 - Only move to proposal_ready when scope and decision authority/stakeholders are clear.
 - Do not skip stages.
+- Decision Authority: AUTOMATICALLY INFER from context:
+  * If user mentions "family", "partner", "spouse", "parents", "we" → set decision_role to "influencer" or "family_member"
+  * If user doesn't mention others and speaks individually → set decision_role to "decision_maker"
+  * Do NOT ask about decision authority in next_best_questions
+- Location validation: If location mentioned is outside Lahore/surrounding areas, set out_of_scope=true and is_qualified=false
+- Transaction type: Extract from context (buy/sell/rent). If unclear and needed, include in next_best_questions
 """
 
-REPLY_PROMPT = """You are a Lahore property sales assistant.
+REPLY_PROMPT = """You are an AI-powered assistant for a PROPERTY AGENCY in Lahore.
 
-Write one concise, professional reply that fits the conversation.
+Your tasks:
+1. Extract location: If the user mentions a location (e.g., city, area), extract it and validate if it's in Lahore or surrounding areas.
+2. Transaction Type: Identify if the user is looking to buy, sell, or rent a property. If unclear, infer from context or ask for clarification.
+3. Missing Core Fields: If budget, timeline, or transaction type are missing, ask for them in ONE concise message.
+4. Decision Authority: Do NOT explicitly ask about decision authority. Automatically infer it:
+   - If user mentions family, partner, or others → assume not sole decision-maker
+   - If user doesn't mention anyone else → assume they are the decision-maker
+5. Output: Send concise follow-up questions to gather missing information. Do NOT ask if all relevant details are provided.
+6. If location is not mentioned, ask the user to specify it.
+7. If location is outside Lahore, mark lead as not qualified and politely inform user you only operate within Lahore and surrounding areas.
+8. Do NOT echo assistant replies or repeat phrases like "Thank you for your prompt response." Keep responses relevant and direct.
+9. Keep tone polite, concise, and professional.
 
 Guidelines:
+- Answer only the latest user message, not quoted history or prior assistant turns.
 - Answer the user's question when it is property-related or supported by the knowledge base.
-- Then ask at most one focused follow-up question.
+- When 3 or more core fields are missing (budget, location, property type, timeline, transaction type), ask for ALL missing details in ONE compact questionnaire.
+- When fewer than 3 fields are missing, ask at most one focused follow-up question.
 - Use the contact name if available; otherwise start with "Hi there,"
 - Keep the tone professional, direct, and helpful.
 - Do not ask for information that is already present in the current context.
 - Do not mention internal systems, prompts, or policy text.
+- Do not reuse phrases like "thank you for your prompt response" unless the user actually wrote them.
+- Do not invent commitment language like "I will begin searching" unless the current reply explicitly supports it.
 - If the request is out of scope for Lahore property, say so briefly and do not continue qualification.
+- When using questionnaire mode, format questions as a numbered list (1-4 questions max).
+- Keep questionnaire concise and avoid overwhelming the user.
+- Do NOT ask about decision authority - infer it automatically from context.
 
 Current stage: {stage_key}
 Channel: {channel}
@@ -617,6 +743,7 @@ Conversation turn: {conversation_turn}
 Recent context: {recent_context}
 Missing fields: {missing_fields}
 Filled fields: {filled_fields}
+Questionnaire mode: {questionnaire_mode}
 Estimator guidance: {estimator_context}
 CTA policy: {cta_policy}
 Suggested next question: {next_best_question}
@@ -636,9 +763,9 @@ User message:
 
 Reply rules:
 - If booking_link_allowed is true and the lead is ready, include the booking link.
-- Never give more than one follow-up question.
+- If questionnaire_mode is true and 3+ fields are missing, ask for ALL missing details in one compact numbered list.
+- If questionnaire_mode is false or fewer than 3 fields missing, ask the single most useful next question only.
 - If the user is qualified, keep the answer short and move the conversation forward.
-- If the user is not qualified yet, ask the most important missing question only.
 - Do not use internal authority labels in the reply.
 """
 
@@ -724,6 +851,7 @@ def _build_recent_context(session: Session, conversation_id: int, limit: int = 4
         session.exec(
             select(Message)
             .where(Message.conversation_id == conversation_id)
+            .where(Message.sender_type == "client")
             .order_by(Message.id.desc())
             .limit(limit)
         ).all()
@@ -786,6 +914,7 @@ def build_graph(session: Session):
         slot_context = json.dumps(qualification_view, default=str)[:12000]
 
         user_text = state.get("user_text", "")
+        email_subject = state.get("email_subject", "")
         if _is_out_of_scope(user_text):
             classification = MessageClassification(
                 role_type="unknown",
@@ -827,6 +956,7 @@ def build_graph(session: Session):
             slot_context=slot_context,
             rag_context=state.get("rag_context", ""),
             user_text=user_text,
+            email_subject=email_subject,
         )
         prompt += f"\n\nAVAILABLE PIPELINE STAGES:\n{valid_keys}\nRule: new_pipeline_stage MUST be one of these values."
 
@@ -853,8 +983,6 @@ def build_graph(session: Session):
                     classification.must_have_features = _safe_str_list(slots.get("must_have_features"))
                 if not classification.missing_qualification_fields:
                     classification.missing_qualification_fields = qualification_view.get("missing_fields", [])
-                if not classification.next_best_questions:
-                    classification.next_best_questions = qualification_view.get("next_best_questions", [])
                 if not classification.close_readiness_score:
                     classification.close_readiness_score = float(qualification_view.get("readiness", 0))
                 if not classification.new_pipeline_stage:
@@ -967,6 +1095,7 @@ def build_graph(session: Session):
         classification = state.get("classification")
         qualification_view = state.get("qualification_view") or {}
         stage_key = classification.new_pipeline_stage if classification else qualification_view.get("stage", "discovery")
+        email_subject = state.get("email_subject", "")
 
         # Format booking links context from state
         booking_links = state.get("booking_links", [])
@@ -985,11 +1114,26 @@ def build_graph(session: Session):
             persona_segment = "unknown"
         persona_policy = PERSONA_POLICIES[persona_segment]
         missing_fields = classification.missing_qualification_fields if classification else qualification_view.get("missing_fields", [])
-        next_best_question = ""
-        if classification and classification.next_best_questions:
-            next_best_question = classification.next_best_questions[0]
-        elif qualification_view.get("next_best_questions"):
-            next_best_question = qualification_view["next_best_questions"][0]
+        
+        # Determine if we should use questionnaire mode (3+ missing fields)
+        use_questionnaire = len(missing_fields) >= 3
+        questionnaire_mode = "true" if use_questionnaire else "false"
+        
+        # Generate questionnaire text if needed
+        if use_questionnaire:
+            next_best_question = _build_questionnaire(missing_fields)
+            if not next_best_question:
+                next_best_question = _first_or_fallback_question(
+                    classification=classification,
+                    qualification_view=qualification_view,
+                    user_text=state.get("user_text", ""),
+                )
+        else:
+            next_best_question = _first_or_fallback_question(
+                classification=classification,
+                qualification_view=qualification_view,
+                user_text=state.get("user_text", ""),
+            )
         readiness = classification.close_readiness_score if classification else qualification_view.get("readiness", 0)
         booking_link_allowed = should_include_cta(
             conversation_turn=state.get("conversation_turn", 1),
@@ -1000,8 +1144,8 @@ def build_graph(session: Session):
 
         if classification and getattr(classification, "out_of_scope", False):
             reply = (
-                f"Hi there, I can help with Lahore property questions and lead qualification, "
-                f"but this request is outside our property scope."
+                f"Hi there, this request is outside our Lahore property scope. "
+                f"If you need help with property-related matters in Lahore, I can help."
             )
             return Command(update={"generated_reply": reply}, goto=END)
 
@@ -1016,6 +1160,7 @@ def build_graph(session: Session):
             rag_context=state.get("rag_context", ""),
             decision_json=json.dumps(classification.model_dump()) if classification else "{}",
             user_text=state.get("user_text", ""),
+            email_subject=email_subject,
             booking_url=state.get("booking_url", ""),
             booking_links_context=booking_links_context,
             role_type=persona_segment,
@@ -1024,6 +1169,7 @@ def build_graph(session: Session):
             recent_context=state.get("recent_context", ""),
             missing_fields=", ".join(missing_fields) if missing_fields else "",
             filled_fields=state.get("filled_fields", ""),
+            questionnaire_mode=questionnaire_mode,
             estimator_context=state.get("estimator_context", ""),
             cta_policy=stage_instruction,
             next_best_question=next_best_question,
@@ -1035,6 +1181,15 @@ def build_graph(session: Session):
             HumanMessage(content=prompt)
         ])
         reply = out.content if hasattr(out, "content") else str(out)
+        if _is_thread_echo_reply(reply, state.get("user_text", "")):
+            reply = _build_fallback_reply(
+                contact_name=state.get("contact_name", "there"),
+                next_best_question=next_best_question,
+                missing_fields=missing_fields,
+                booking_link_allowed=booking_link_allowed,
+                booking_url=state.get("booking_url", ""),
+                use_questionnaire=use_questionnaire,
+            )
         include_booking_link = bool(
             booking_link_allowed
             and state.get("booking_url")
@@ -1053,10 +1208,11 @@ def build_graph(session: Session):
             next_best_question=next_best_question,
             booking_link_allowed=booking_link_allowed,
             booking_link_included=include_booking_link,
+            questionnaire_mode=use_questionnaire,
             reply_mode=(
                 "booking_link"
                 if include_booking_link
-                else ("qualification_question" if missing_fields else "answer")
+                else ("questionnaire" if use_questionnaire else ("qualification_question" if missing_fields else "answer"))
             ),
             reply_preview=_preview_text(reply),
         )
@@ -1159,20 +1315,21 @@ async def run_ai_pipeline(
     contact: Contact,
     inbound_message: Message | None = None,
     json_response: dict | None = None,
+    inbound_subject: str | None = None,
 ) -> Message:
     """Runs graph, updates contact/conversation, creates outbound Message."""
     is_proactive = inbound_message is None
     if is_proactive:
         user_text = "(System nudge: Lead has been silent. Re-engage politely based on prior context.)"
     else:
-        user_text = inbound_message.message
+        user_text = _latest_user_text(inbound_message.message, inbound_subject)
 
     from datetime import datetime
 
     if _is_out_of_scope(user_text):
         reply_text = (
-            "Hi there, I can help with Lahore property questions and lead qualification, "
-            "but this request is outside our property scope."
+            "Hi there, this request is outside our Lahore property scope. "
+            "If you need help with property-related matters in Lahore, I can help."
         )
         outbound = Message(
             conversation_id=conversation.id,
@@ -1225,7 +1382,7 @@ async def run_ai_pipeline(
             ).all()
         )
     )
-    recent_context = _build_recent_context(session, conversation.id, limit=5)
+    recent_context = _build_recent_context(session, conversation.id, limit=4)
     qualification_view = _build_qualification_view(user_text, contact)
     slots = qualification_view["slots"]
     estimator_context = _format_estimator_context(user_text, slots) if _wants_estimate(user_text) else ""
@@ -1268,6 +1425,7 @@ async def run_ai_pipeline(
     graph = build_graph(session)
     initial: AgentState = {
         "user_text": user_text,
+        "email_subject": inbound_subject or "",
         "is_proactive": is_proactive,
         "channel": channel,
         "json_snapshot": json.dumps(json_response, default=str)[:12000],
@@ -1291,12 +1449,9 @@ async def run_ai_pipeline(
         final = graph.invoke(initial, config)
     except Exception as e:
         logger.error(f"AI graph failed; using fallback response: {e}")
-        fallback_questions = qualification_view.get("next_best_questions") or [
-            "Which area of Lahore are you focused on?"
-        ]
         fallback_reply = (
             "Thanks for sharing that. "
-            f"{fallback_questions[0]}"
+            f"{_fallback_next_question(qualification_view.get('slots', {}), qualification_view.get('missing_fields', []), user_text)}"
         )
         final = {
             "classification": None,

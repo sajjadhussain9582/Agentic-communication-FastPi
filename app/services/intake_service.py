@@ -10,8 +10,47 @@ from app.services.channel_delivery import deliver_message
 from datetime import datetime
 import asyncio
 import logging
+import re
 
 logger = logging.getLogger(__name__)
+
+
+_SIGNATURE_SEPARATOR_RE = re.compile(r"(?im)^\s*(?:--\s*$|best regards,?\s*$|regards,?\s*$|thanks,?\s*$|sent from my .*$)")
+_QUOTED_REPLY_MARKERS = (
+    "on ",
+    "wrote:",
+    "from:",
+    "sent:",
+    "to:",
+    "subject:",
+)
+
+
+def _strip_quoted_thread(message_body: str) -> str:
+    """Keep only the newest human-written segment from an email thread."""
+    text = (message_body or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    kept: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            kept.append("")
+            continue
+        if stripped.startswith(">"):
+            break
+        if stripped.lower().startswith(_QUOTED_REPLY_MARKERS):
+            if stripped.startswith("On ") and " wrote:" not in stripped.lower():
+                kept.append(line)
+                continue
+            break
+        if _SIGNATURE_SEPARATOR_RE.match(stripped):
+            break
+        kept.append(line)
+
+    cleaned = "\n".join(kept).strip()
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
 
 async def process_inbound_message(session: Session, channel: str, sender_details: dict[str, Any], message_body: str, subject: str = None) -> Conversation:
     logger.info(f"Processing inbound {channel} message from {sender_details} subject: {subject}")
@@ -67,14 +106,15 @@ async def process_inbound_message(session: Session, channel: str, sender_details
         session.commit()
         session.refresh(conv)
 
-    user_text = f"Subject: {subject}\n\n{message_body}" if subject else message_body
+    cleaned_body = _strip_quoted_thread(message_body)
+    stored_message = cleaned_body or (subject or "").strip() or (message_body or "").strip()
 
     inbound = Message(
         conversation_id=conv.id,
         conversation_public_uuid=conv.public_uuid,
         sender_type="client",
         message_type="text",
-        message=user_text,
+        message=stored_message,
         channel=channel,
         is_generated=False,
         is_handled=False,
@@ -85,7 +125,14 @@ async def process_inbound_message(session: Session, channel: str, sender_details
 
     try:
         logger.info(f"Running AI pipeline for conversation {conv.id}, contact {contact.id}")
-        outbound = await run_ai_pipeline(session, conv, contact, inbound, {})
+        outbound = await run_ai_pipeline(
+            session,
+            conv,
+            contact,
+            inbound,
+            {"subject": subject or "", "raw_body": message_body, "cleaned_body": cleaned_body},
+            inbound_subject=subject or "",
+        )
         if outbound:
             logger.info(f"Generated outbound message: {outbound.message[:100]}...")
             # Fix: call with keyword arguments as deliver_message expects them

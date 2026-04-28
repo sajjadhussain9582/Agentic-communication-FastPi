@@ -4,6 +4,7 @@ from app.api.routes.users import router as users_router
 from app.core.middleware import setup_cors
 from app.core.logging import setup_logging
 from app.core.database import init_db
+from app.core.config import settings
 
 
 def create_app():
@@ -25,6 +26,15 @@ def create_app():
 
         with Session(engine) as session:
             seed_if_empty(session)
+        
+        # Initialize LangSmith tracing (optional, graceful failure)
+        from app.core.langsmith_setup import initialize_langsmith
+        initialize_langsmith(
+            api_key=settings.LANGSMITH_API_KEY,
+            tracing_enabled=settings.LANGSMITH_TRACING,
+            project_name=settings.LANGSMITH_PROJECT,
+            endpoint=settings.LANGSMITH_ENDPOINT if settings.LANGSMITH_ENDPOINT else None,
+        )
         
         from app.services.worker import start_worker
         start_worker()

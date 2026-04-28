@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     GMAIL_APP_PASSWORD: str = ""
     SMTP_PORT: int = 587
 
+    # LangSmith Observability (optional)
+    LANGSMITH_API_KEY: str = ""
+    LANGSMITH_TRACING: bool = False
+    LANGSMITH_PROJECT: str = "agentic-communication"
+    LANGSMITH_ENDPOINT: str = "https://api.smith.langchain.com"
+
     class Config:
         env_file = ".env"
         extra = "allow"

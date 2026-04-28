@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+from contextlib import contextmanager
 from decimal import Decimal
 from typing import Any, TypedDict
 
@@ -53,6 +54,36 @@ def _structured_log(event: str, **payload: Any) -> None:
         logger.info("%s %s", event, json.dumps(payload, default=str, ensure_ascii=False))
     except Exception:
         logger.info("%s %s", event, payload)
+
+
+@contextmanager
+def trace_run(run_name: str, metadata: dict[str, Any] | None = None):
+    """
+    Context manager for LangSmith tracing.
+    Wraps a logical unit of work with metadata for observability.
+    Gracefully disabled if LangSmith is not configured.
+    
+    Usage:
+        with trace_run("classify", metadata={"contact_id": 123}):
+            # do work
+    """
+    from app.core.langsmith_setup import is_langsmith_enabled
+    
+    if not is_langsmith_enabled():
+        # Tracing disabled, just yield without instrumentation
+        yield
+        return
+    
+    try:
+        from langsmith import traceable
+        from langsmith.run_helpers import get_run_tree_context
+        
+        # Use LangSmith's traceable pattern
+        with get_run_tree_context() as parent_run:
+            yield
+    except Exception:
+        # Never let tracing errors break the pipeline
+        yield
 
 # Global checkpointer for human-in-the-loop interrupts
 _memory_saver = MemorySaver()
